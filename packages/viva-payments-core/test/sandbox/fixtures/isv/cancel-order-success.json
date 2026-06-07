@@ -1,0 +1,11 @@
+{
+  "_meta": {
+    "scenario": "Successful order cancellation for an unpaid order",
+    "doc_ref": "references/viva-docs/md/payment-isv-api.txt:1",
+    "captured_at": "2026-04-25",
+    "notes": "DELETE /checkout/v2/orders/{orderCode}?merchantId={merchantId} response. errorCode=0 indicates success. Idempotent — safe to retry."
+  },
+  "OrderCode": "1234567890123456",
+  "errorCode": 0,
+  "errorText": "No Error"
+}
