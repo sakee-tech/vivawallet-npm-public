@@ -1,0 +1,11 @@
+{
+  "_meta": {
+    "scenario": "Successful full refund of a captured transaction via legacy host",
+    "doc_ref": "references/viva-docs/md/isv-partner-program.txt:296",
+    "captured_at": "2026-04-25",
+    "notes": "POST /api/transactions/{transactionId} on legacy host (demo.vivapayments.com) with Basic auth. Probe-verified 2026-04-25 (F1): v2/OAuth2 path returns 405. Legacy API returns PascalCase JSON."
+  },
+  "TransactionId": "bbbbbbbb-2222-3333-4444-eeeeeeeeeeee",
+  "StatusId": "F",
+  "Amount": 9999
+}
