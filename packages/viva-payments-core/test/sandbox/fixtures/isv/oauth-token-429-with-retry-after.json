@@ -1,0 +1,13 @@
+{
+  "_meta": {
+    "scenario": "OAuth2 token endpoint rate-limited with Retry-After header",
+    "doc_ref": "references/viva-docs/md/isv-partner-program.txt:104",
+    "captured_at": "2026-04-25",
+    "notes": "HTTP 429 with Retry-After: 1. Client should honour the Retry-After and back off."
+  },
+  "error": "rate_limit_exceeded",
+  "error_description": "Too many requests. Retry after the specified delay.",
+  "_headers": {
+    "Retry-After": "1"
+  }
+}
