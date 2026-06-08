@@ -1,0 +1,12 @@
+{
+  "_meta": {
+    "scenario": "Successful webhook registration via ISV Create Webhook API",
+    "doc_ref": "references/viva-docs/md/webhooks-for-payments.txt:270",
+    "captured_at": "2026-04-25",
+    "notes": "POST /api/ms/v2/isv/webhooks response. webhookId is a UUID assigned by Viva. Used by viva:register-webhooks CLI (P12)."
+  },
+  "webhookId": "f1f1f1f1-f1f1-f1f1-f1f1-f1f1f1f1f1f1",
+  "url": "https://demo-api.vivapayments.com/viva/webhook",
+  "eventTypeId": 1796,
+  "active": true
+}

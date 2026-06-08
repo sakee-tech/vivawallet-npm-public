@@ -1,0 +1,29 @@
+{
+  "_meta": {
+    "scenario": "Webhook envelope for EventTypeId=7936 Sale Transactions (HMAC-signed)",
+    "doc_ref": "references/viva-docs/md/wh-sale-transactions.txt:118",
+    "captured_at": "2026-04-25",
+    "notes": "7936 is the only event type where Viva includes a Viva-Signature-256 HMAC header. The signature covers the raw request body (JSON.stringify of the envelope object). testSecret='test-secret', algorithm=SHA-256. At test time: verify with crypto.createHmac('sha256', secret).update(rawBody).digest('hex') === signatureHex. rawBody stored as the exact JSON string that was signed."
+  },
+  "rawBody": "{\"Url\":\"https://demo-api.vivapayments.com/viva/webhook\",\"EventData\":{\"FileId\":\"a1b2c3d4-e5f6-7890-abcd-ef1234567890\",\"FileName\":\"20260425_sales_report.csv\",\"FileSize\":12345,\"CreatedAt\":\"2026-04-25T10:00:00Z\"},\"Created\":\"2026-04-25T10:00:00.000Z\",\"CorrelationId\":\"550e8400-e29b-41d4-a716-446655440000\",\"EventTypeId\":7936,\"Delay\":null,\"MessageId\":\"f7936000-aaaa-bbbb-cccc-dddddddddddd\",\"RecipientId\":\"a1a1a1a1-a1a1-a1a1-a1a1-a1a1a1a1a1a1\",\"MessageTypeId\":512,\"RetryCount\":0,\"RetryDelayInSeconds\":null}",
+  "signatureHex": "30fc36f15c383a2fa20a647f0fa8f1b761f4c98e136ef11c4c076c9f84933613",
+  "testSecret": "test-secret",
+  "envelope": {
+    "Url": "https://demo-api.vivapayments.com/viva/webhook",
+    "EventData": {
+      "FileId": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+      "FileName": "20260425_sales_report.csv",
+      "FileSize": 12345,
+      "CreatedAt": "2026-04-25T10:00:00Z"
+    },
+    "Created": "2026-04-25T10:00:00.000Z",
+    "CorrelationId": "550e8400-e29b-41d4-a716-446655440000",
+    "EventTypeId": 7936,
+    "Delay": null,
+    "MessageId": "f7936000-aaaa-bbbb-cccc-dddddddddddd",
+    "RecipientId": "a1a1a1a1-a1a1-a1a1-a1a1-a1a1a1a1a1a1",
+    "MessageTypeId": 512,
+    "RetryCount": 0,
+    "RetryDelayInSeconds": null
+  }
+}
