@@ -1,0 +1,63 @@
+{
+  "name": "@sakeetech/medusa-payment-viva",
+  "version": "0.2.2",
+  "description": "Medusa v2 payment provider for Viva Wallet (ISV multi-tenant). Wraps viva-payments-core.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/sakee-tech/vivawallet-npm-public.git",
+    "directory": "packages/medusa-payment-viva"
+  },
+  "homepage": "https://github.com/sakee-tech/vivawallet-npm-public/tree/main/packages/medusa-payment-viva#readme",
+  "bugs": {
+    "url": "https://github.com/sakee-tech/vivawallet-npm-public/issues"
+  },
+  "type": "commonjs",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "bin": {
+    "viva-register-webhooks": "./dist/cli/bin.js"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "clean": "rm -rf dist .tsbuildinfo coverage"
+  },
+  "dependencies": {
+    "@sakeetech/viva-payments-core": "workspace:*",
+    "uuid": "^9.0.1"
+  },
+  "peerDependencies": {
+    "@medusajs/framework": "^2.0.0",
+    "@medusajs/types": "^2.0.0"
+  },
+  "devDependencies": {
+    "@medusajs/framework": "^2.0.0",
+    "@medusajs/types": "^2.0.0",
+    "@types/pg": "^8.11.10",
+    "@types/uuid": "^9.0.8",
+    "pg": "^8.13.3",
+    "typescript": "^5.7.2",
+    "undici": "^7.2.0",
+    "vitest": "^2.1.8"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}

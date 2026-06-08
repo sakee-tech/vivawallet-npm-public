@@ -1,0 +1,16 @@
+{
+  "_meta": {
+    "scenario": "List registered webhooks — six webhooks registered (all v1 event types)",
+    "doc_ref": "references/viva-docs/md/webhooks-for-payments.txt:270",
+    "captured_at": "2026-04-25",
+    "notes": "Six webhooks registered: 1796, 1797, 1798, 4865, 8193, 8194. Viva allows up to 10 registrations per event type. Used to test the CLI idempotency check skipping already-registered types."
+  },
+  "webhooks": [
+    { "webhookId": "aa000001-0000-0000-0000-000000000001", "url": "https://demo-api.vivapayments.com/viva/webhook", "eventTypeId": 1796, "active": true },
+    { "webhookId": "aa000001-0000-0000-0000-000000000002", "url": "https://demo-api.vivapayments.com/viva/webhook", "eventTypeId": 1797, "active": true },
+    { "webhookId": "aa000001-0000-0000-0000-000000000003", "url": "https://demo-api.vivapayments.com/viva/webhook", "eventTypeId": 1798, "active": true },
+    { "webhookId": "aa000001-0000-0000-0000-000000000004", "url": "https://demo-api.vivapayments.com/viva/webhook", "eventTypeId": 4865, "active": true },
+    { "webhookId": "aa000001-0000-0000-0000-000000000005", "url": "https://demo-api.vivapayments.com/viva/webhook", "eventTypeId": 8193, "active": true },
+    { "webhookId": "aa000001-0000-0000-0000-000000000006", "url": "https://demo-api.vivapayments.com/viva/webhook", "eventTypeId": 8194, "active": true }
+  ]
+}
