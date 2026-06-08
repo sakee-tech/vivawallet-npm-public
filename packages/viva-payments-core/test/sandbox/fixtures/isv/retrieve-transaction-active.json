@@ -1,0 +1,24 @@
+{
+  "_meta": {
+    "scenario": "Retrieve transaction — StatusId=A (Active/authorized)",
+    "doc_ref": "references/viva-docs/md/wh-transaction-payment-created.txt:398",
+    "captured_at": "2026-04-25",
+    "notes": "Authorized but not yet captured. Maps to plugin status='authorized' (P17)."
+  },
+  "transactionId": "aaaaaaaa-1111-2222-3333-cccccccccccc",
+  "orderCode": "1234567890123456",
+  "statusId": "A",
+  "amount": 9999,
+  "currencyCode": "978",
+  "merchantId": "cccccccc-dddd-eeee-ffff-000000000001",
+  "parentId": null,
+  "insDate": "2026-04-25T09:55:00.000Z",
+  "transactionTypeId": 5,
+  "cardNumber": "414746XXXXXX0133",
+  "cardTypeId": 0,
+  "email": "customer@example.com",
+  "fullName": "Test Customer",
+  "merchantTrns": "pay_s11_test_001",
+  "customerTrns": "Payment via Viva Wallet",
+  "connectedAccountId": "eeeeeeee-ffff-0000-1111-222222222222"
+}
