@@ -1,0 +1,27 @@
+{
+  "_meta": {
+    "scenario": "Retrieve Transaction — StatusId=F (Finished/captured)",
+    "source": "Adapted from viva-payments-core sandbox fixtures",
+    "captured_at": "2026-04-25",
+    "notes": "Returned by GET /checkout/v2/isv/transactions/{id}?merchantId=... on a successful capture. Amount 9999 minor units = GBP 99.99. No real credentials."
+  },
+  "transactionId": "aaaaaaaa-1111-2222-3333-bbbbbbbbbbbb",
+  "orderCode": "1234567890123456",
+  "statusId": "F",
+  "amount": 9999,
+  "currencyCode": "826",
+  "merchantId": "cccccccc-dddd-eeee-ffff-000000000001",
+  "parentId": null,
+  "insDate": "2026-04-25T10:00:00.000Z",
+  "transactionTypeId": 5,
+  "cardNumber": "414746XXXXXX0133",
+  "cardTypeId": 0,
+  "email": "test-customer@example.com",
+  "fullName": "Test Customer",
+  "merchantTrns": "vnd-pay-test-001",
+  "customerTrns": "Payment via Viva Wallet",
+  "connectedAccountId": "eeeeeeee-ffff-0000-1111-222222222222",
+  "acquirerApproved": true,
+  "authorizationId": "123456",
+  "referenceNumber": 100001
+}

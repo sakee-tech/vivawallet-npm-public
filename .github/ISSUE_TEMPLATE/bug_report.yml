@@ -1,0 +1,92 @@
+name: 🐛 Bug report
+description: Report a defect in one of the packages. The clearer the repro, the faster the fix.
+title: "[bug]: "
+labels: ["bug", "needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the report. This repo is a read-only mirror — the fix
+        will land upstream and ship in a new npm release. Please fill in
+        every field; reports missing a version or reproduction are labelled
+        `needs-info` and may be closed if not completed.
+  - type: dropdown
+    id: package
+    attributes:
+      label: Package
+      description: Which package is affected?
+      options:
+        - "@sakeetech/viva-payments-core"
+        - "@sakeetech/vendure-payment-viva"
+        - "@sakeetech/medusa-payment-viva"
+        - Not sure
+    validations:
+      required: true
+  - type: input
+    id: package-version
+    attributes:
+      label: Package version
+      description: Exact version from your lockfile (e.g. 0.2.1).
+      placeholder: "0.2.1"
+    validations:
+      required: true
+  - type: input
+    id: framework-version
+    attributes:
+      label: Framework & version
+      description: Vendure / Medusa version, Node version.
+      placeholder: "@vendure/core 3.6.2, Node 20.11"
+    validations:
+      required: true
+  - type: dropdown
+    id: mode
+    attributes:
+      label: Mode
+      options:
+        - merchant
+        - isv
+        - "not applicable"
+    validations:
+      required: true
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What did you observe? Include the exact error message and any error code (e.g. VIVA_MODE_MISMATCH).
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      description: Minimal steps. A code snippet or minimal repo is ideal.
+      placeholder: |
+        1. Configure plugin with mode: 'isv'
+        2. Call ...
+        3. Webhook 1796 arrives ...
+        4. See error ...
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs
+      description: Paste logs. **Redact all secrets, tokens, and customer data.** Include x-viva-correlationid if available.
+      render: shell
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Confirmations
+      options:
+        - label: I am on the latest published version (or have noted why not).
+          required: true
+        - label: I have removed all secrets and personal data from this report.
+          required: true
+        - label: This is not a security vulnerability (those go through private reporting).
+          required: true

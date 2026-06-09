@@ -1,0 +1,10 @@
+{
+  "_meta": {
+    "scenario": "Refund rejected — transaction already fully refunded",
+    "doc_ref": "references/viva-docs/md/isv-partner-program.txt:296",
+    "captured_at": "2026-04-25",
+    "notes": "HTTP 422 returned when attempting to refund a transaction whose StatusId is already R. The plugin should surface this as VivaApiError and NOT update the DB status."
+  },
+  "error": "TRANSACTION_ALREADY_REFUNDED",
+  "message": "The transaction has already been fully refunded and cannot be refunded again."
+}
