@@ -1,0 +1,76 @@
+{
+  "name": "@sakeetech/vendure-payment-viva",
+  "version": "0.2.12",
+  "description": "Vendure plugin for Viva Wallet (ISV multi-tenant). Wraps viva-payments-core.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/sakee-tech/vivawallet-npm-public.git",
+    "directory": "packages/vendure-payment-viva"
+  },
+  "homepage": "https://github.com/sakee-tech/vivawallet-npm-public/tree/main/packages/vendure-payment-viva#readme",
+  "bugs": {
+    "url": "https://github.com/sakee-tech/vivawallet-npm-public/issues"
+  },
+  "type": "commonjs",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "bin": {
+    "vendure-viva-register-webhooks": "./dist/cli/bin.js"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "clean": "rm -rf dist .tsbuildinfo coverage"
+  },
+  "dependencies": {
+    "@sakeetech/viva-payments-core": "workspace:*"
+  },
+  "peerDependencies": {
+    "@nestjs/common": "^11.0.0",
+    "@nestjs/core": "^11.0.0",
+    "@vendure/core": "^3.6.2",
+    "@vendure/job-queue-plugin": "^3.6.2",
+    "graphql": "^16.0.0",
+    "rxjs": "^7.0.0",
+    "typeorm": "^0.3.0"
+  },
+  "devDependencies": {
+    "@nestjs/common": "^11.1.19",
+    "@nestjs/core": "^11.1.19",
+    "@nestjs/graphql": "13.1.0",
+    "@swc/core": "^1.15.40",
+    "@types/node": "^22.10.0",
+    "@types/pg": "^8.11.0",
+    "@vendure/core": "^3.6.2",
+    "@vendure/job-queue-plugin": "^3.6.2",
+    "@vendure/testing": "^3.6.2",
+    "graphql": "^16.13.2",
+    "pg": "^8.13.3",
+    "rxjs": "^7.8.2",
+    "typeorm": "^0.3.28",
+    "typescript": "^5.7.2",
+    "undici": "^7.2.0",
+    "unplugin-swc": "^1.5.9",
+    "vitest": "^2.1.8"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}
