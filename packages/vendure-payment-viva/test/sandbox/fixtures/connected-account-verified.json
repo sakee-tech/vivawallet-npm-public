@@ -1,0 +1,18 @@
+{
+  "_meta": {
+    "scenario": "GET /accounts/v1/connected-accounts/{accountId} — verified merchant",
+    "captured_at": "2026-04-25",
+    "notes": "Response from IsvAccounts.retrieveConnectedAccount after KYC approval. merchantId is the per-merchant routing UUID written to channel custom fields. No real credentials."
+  },
+  "accountId": "eeeeeeee-ffff-0000-1111-222222222222",
+  "merchantId": "cccccccc-dddd-eeee-ffff-000000000001",
+  "status": "Verified",
+  "verificationStatus": "Approved",
+  "payoutsEnabled": true,
+  "legalName": "Test Merchant Ltd",
+  "email": "merchant@example.com",
+  "country": "GB",
+  "currency": "GBP",
+  "createdAt": "2026-04-25T07:00:00.000Z",
+  "updatedAt": "2026-04-25T08:30:00.000Z"
+}

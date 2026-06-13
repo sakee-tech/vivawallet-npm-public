@@ -1,0 +1,37 @@
+{
+  "name": "viva-payments-monorepo",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Viva Wallet plugin for Medusa v2 and Vendure (ISV multi-tenant). Monorepo root.",
+  "license": "MIT",
+  "type": "module",
+  "engines": {
+    "node": ">=20.0.0",
+    "pnpm": ">=9.0.0"
+  },
+  "packageManager": "pnpm@10.33.0",
+  "scripts": {
+    "build": "pnpm -r --filter='./packages/*' build",
+    "typecheck": "pnpm -r --filter='./packages/*' typecheck",
+    "test": "pnpm -r --filter='./packages/*' test",
+    "precheck": "pnpm -F @sakeetech/viva-payments-core build && pnpm -r --filter='./packages/*' typecheck && pnpm -r --filter='./packages/*' test",
+    "test:watch": "pnpm -r --parallel --filter='./packages/*' test:watch",
+    "lint": "pnpm -r --filter='./packages/*' lint",
+    "clean": "pnpm -r --filter='./packages/*' clean && rm -rf node_modules",
+    "changeset": "changeset",
+    "version-packages": "changeset version",
+    "release": "pnpm build && changeset publish",
+    "release:next:dry": "pnpm -r --filter='./packages/*' build && pnpm -r --filter='./packages/*' publish --tag next --access public --no-git-checks --dry-run",
+    "release:next": "pnpm -r --filter='./packages/*' build && pnpm -r --filter='./packages/*' publish --tag next --access public --no-git-checks",
+    "docs:dev": "pnpm -F @sakeetech/viva-payments-docs dev",
+    "docs:build": "pnpm -F @sakeetech/viva-payments-docs build",
+    "docs:preview": "pnpm -F @sakeetech/viva-payments-docs preview"
+  },
+  "devDependencies": {
+    "@changesets/cli": "^2.27.9",
+    "@types/node": "^22.10.0",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2",
+    "vitest": "^2.1.8"
+  }
+}
