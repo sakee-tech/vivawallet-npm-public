@@ -1,0 +1,10 @@
+# VitePress build output + cache
+src/.vitepress/dist
+src/.vitepress/cache
+
+# Synced content (generated from repo root by scripts/sync.mjs).
+# Source of truth lives in /README.md, /docs/*.md, /packages/*/README.md.
+src/reference/
+src/packages/
+src/guides/
+src/overview.md
