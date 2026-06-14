@@ -1,0 +1,74 @@
+{
+  "name": "@sakeetech/medusa-payment-viva",
+  "version": "0.3.1",
+  "description": "Medusa v2 payment provider for Viva Wallet (ISV multi-tenant). Wraps viva-payments-core.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/sakee-tech/vivawallet-npm-public.git",
+    "directory": "packages/medusa-payment-viva"
+  },
+  "homepage": "https://github.com/sakee-tech/vivawallet-npm-public/tree/main/packages/medusa-payment-viva#readme",
+  "bugs": {
+    "url": "https://github.com/sakee-tech/vivawallet-npm-public/issues"
+  },
+  "type": "commonjs",
+  "main": "./.medusa/server/src/index.js",
+  "types": "./.medusa/server/src/index.d.ts",
+  "bin": {
+    "viva-register-webhooks": "./.medusa/server/src/cli/bin.js"
+  },
+  "exports": {
+    ".": {
+      "types": "./.medusa/server/src/index.d.ts",
+      "default": "./.medusa/server/src/index.js"
+    },
+    "./admin": {
+      "types": "./.medusa/server/src/admin/index.d.ts",
+      "default": "./.medusa/server/src/admin/index.js"
+    },
+    "./.medusa/server/src/modules/*": {
+      "default": "./.medusa/server/src/modules/*/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "files": [
+    ".medusa",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "./node_modules/.bin/medusa plugin:build",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "clean": "rm -rf dist .medusa .tsbuildinfo coverage"
+  },
+  "dependencies": {
+    "@sakeetech/viva-payments-core": "workspace:*",
+    "uuid": "^9.0.1"
+  },
+  "peerDependencies": {
+    "@medusajs/admin-shared": "*",
+    "@medusajs/framework": "^2.0.0",
+    "@medusajs/types": "^2.0.0"
+  },
+  "devDependencies": {
+    "@medusajs/framework": "^2.0.0",
+    "@medusajs/medusa": "2.14.1",
+    "@medusajs/test-utils": "2.14.1",
+    "@medusajs/types": "^2.0.0",
+    "@types/pg": "^8.11.10",
+    "@types/uuid": "^9.0.8",
+    "pg": "^8.13.3",
+    "typescript": "^5.7.2",
+    "undici": "^7.2.0",
+    "vitest": "^2.1.8"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}
