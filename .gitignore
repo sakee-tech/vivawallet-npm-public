@@ -1,0 +1,36 @@
+node_modules/
+dist/
+build/
+.medusa/
+coverage/
+.turbo/
+.tsbuildinfo
+*.tsbuildinfo
+
+.env
+.env.*
+!.env.example
+
+.DS_Store
+*.log
+.pnpm-debug.log
+.npm/
+
+.cache/
+
+# Probe findings (may contain demo merchant data)
+scripts/viva-isv-probe-findings.md
+scripts/viva-*-probe-findings.md
+
+# Local-only — do not publish.
+# Anything under docs/internal/ is private by convention (never mirrored;
+# scripts/sync-public.sh strips docs/internal/ on every sync). These
+# gitignores keep transient artefacts (resume notes, vendored API specs)
+# out of the tracked tree too.
+references/
+docs/resume/
+docs/internal/payment-api.yaml
+docs/internal/payment-isv-api.yaml
+
+# Local Claude Code agent state (worktrees, local settings)
+.claude/

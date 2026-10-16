@@ -1,0 +1,9 @@
+{
+  "_meta": {
+    "scenario": "Successful ISV Create Payment Order for EUR 99.99",
+    "doc_ref": "references/viva-docs/md/payment-isv-api.txt:1",
+    "captured_at": "2026-04-25",
+    "notes": "OrderCode is a 16-digit int64 stored as string to preserve precision above Number.MAX_SAFE_INTEGER (2^53-1=9007199254740991). 9999999999999999 > 9007199254740991 = true, confirming bigint round-trip is necessary. Amount=9999 minor units (EUR 99.99). MerchantId scopes this to the test tenant."
+  },
+  "OrderCode": "9999999999999999"
+}

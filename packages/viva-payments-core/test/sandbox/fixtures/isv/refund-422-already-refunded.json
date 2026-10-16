@@ -1,0 +1,10 @@
+{
+  "_meta": {
+    "scenario": "Refund rejected — transaction already fully refunded",
+    "doc_ref": "docs/internal/payment-isv-api.yaml:2640",
+    "captured_at": "2026-04-25",
+    "notes": "HTTP 422 returned when DELETE /api/transactions/{id} targets a transaction whose StatusId is already R. The plugin should surface this as VivaApiError and NOT update the DB status."
+  },
+  "error": "TRANSACTION_ALREADY_REFUNDED",
+  "message": "The transaction has already been fully refunded and cannot be refunded again."
+}

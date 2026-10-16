@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+# Local pre-push CI gate. Runs build + typecheck + tests across all packages.
+# Replaces the prior .github/workflows/ci.yml.
+#
+# Installation is automatic: `pnpm install` runs the root `prepare` script,
+# which points `core.hooksPath` at `scripts/git-hooks` so this file becomes
+# the active hook for every clone. To bypass for a single push:
+#   git push --no-verify
+
+set -euo pipefail
+
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+cd "$REPO_ROOT"
+
+# Zero-CI invariant: no GitHub Actions workflows in this repo, ever. All CI
+# runs locally via this hook (see header). A tracked .github/workflows/ file
+# would execute on GitHub on push — block it here so the invariant holds on
+# BOTH the private repo and (via sync-public.sh) the public mirror.
+WORKFLOW_FILES="$(git ls-files '.github/workflows' 2>/dev/null || true)"
+if [ -n "$WORKFLOW_FILES" ]; then
+  echo "[pre-push] ERROR: GitHub Actions workflow files are tracked — this repo is zero-CI." >&2
+  echo "$WORKFLOW_FILES" | sed 's/^/  - /' >&2
+  echo "[pre-push] Remove them (git rm) or run CI locally. Aborting push." >&2
+  exit 1
+fi
+
+echo "[pre-push] running pnpm precheck (build + typecheck + test)..."
+
+if ! command -v pnpm >/dev/null 2>&1; then
+  echo "[pre-push] ERROR: pnpm not on PATH; aborting push." >&2
+  exit 1
+fi
+
+if [ -z "${DATABASE_URL:-}" ]; then
+  DEFAULT_DB_URL="postgresql://${USER}@localhost:5432/postgres"
+  export DATABASE_URL="$DEFAULT_DB_URL"
+  echo "[pre-push] DATABASE_URL unset; defaulting to $DEFAULT_DB_URL"
+fi
+
+pnpm precheck
+
+echo "[pre-push] OK — push allowed."
