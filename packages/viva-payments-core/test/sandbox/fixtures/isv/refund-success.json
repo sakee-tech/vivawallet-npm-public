@@ -1,0 +1,11 @@
+{
+  "_meta": {
+    "scenario": "Successful full refund of a captured transaction via legacy host",
+    "doc_ref": "docs/internal/payment-isv-api.yaml:2640",
+    "captured_at": "2026-04-25",
+    "notes": "DELETE /api/transactions/{transactionId}?amount=&sourceCode= on legacy host (demo.vivapayments.com) — Viva 'Cancel transaction'. Merchant mode: Merchant Basic. ISV mode: Reseller Basic (Viva-issued). Success = StatusId 'F'. Legacy API returns PascalCase JSON."
+  },
+  "TransactionId": "bbbbbbbb-2222-3333-4444-eeeeeeeeeeee",
+  "StatusId": "F",
+  "Amount": 9999
+}

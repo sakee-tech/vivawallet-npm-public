@@ -1,0 +1,24 @@
+{
+  "_meta": {
+    "scenario": "Webhook envelope for EventTypeId=8193 Account Connected",
+    "doc_ref": "references/viva-docs/md/wh-account-connected.txt:150",
+    "captured_at": "2026-04-25",
+    "notes": "Sent when a merchant account is successfully connected to the ISV. ConnectedAccountId is the primary routing key for onboarding events. WalletId is an int64 (stored as number here; use BigInt in production code if precision needed)."
+  },
+  "Url": "https://demo-api.vivapayments.com/viva/webhook",
+  "EventData": {
+    "PersonId": "ffffffff-0000-1111-2222-333333333333",
+    "WalletId": 9876543210,
+    "PlatformPersonId": "a1a1a1a1-a1a1-a1a1-a1a1-a1a1a1a1a1a1",
+    "ConnectedAccountId": "eeeeeeee-ffff-0000-1111-222222222222"
+  },
+  "Created": "2026-04-25T08:00:00.000Z",
+  "CorrelationId": "55555555-6666-7777-8888-999999999999",
+  "EventTypeId": 8193,
+  "Delay": null,
+  "MessageId": "496d957d-9da3-4ec0-a435-cc4932459151",
+  "RecipientId": "a1a1a1a1-a1a1-a1a1-a1a1-a1a1a1a1a1a1",
+  "MessageTypeId": 512,
+  "RetryCount": 0,
+  "RetryDelayInSeconds": null
+}

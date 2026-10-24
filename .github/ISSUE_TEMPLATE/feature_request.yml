@@ -1,0 +1,48 @@
+name: ✨ Feature request / change
+description: Propose a feature, enhancement, or behaviour change.
+title: "[feat]: "
+labels: ["enhancement", "needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        This repo is a read-only mirror; accepted proposals are implemented
+        upstream and shipped in a release. There is no PR path — describe the
+        change here and it will be triaged.
+  - type: dropdown
+    id: package
+    attributes:
+      label: Package
+      options:
+        - "@sakeetech/viva-payments-core"
+        - "@sakeetech/vendure-payment-viva"
+        - "@sakeetech/medusa-payment-viva"
+        - Cross-cutting / not sure
+    validations:
+      required: true
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem / motivation
+      description: What are you trying to do that you can't today? Focus on the use case, not a pre-chosen solution.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed change
+      description: What would you like the package to do? API shape, config option, behaviour.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Workarounds you've tried, or other approaches.
+  - type: checkboxes
+    id: scope
+    attributes:
+      label: Scope check
+      options:
+        - label: This is payment-infrastructure behaviour, not app-specific business logic or UI.
+          required: true

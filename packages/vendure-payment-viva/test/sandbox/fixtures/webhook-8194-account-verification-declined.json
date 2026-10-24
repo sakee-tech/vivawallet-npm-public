@@ -1,0 +1,23 @@
+{
+  "_meta": {
+    "scenario": "Vendure — Webhook EventTypeId=8194 Account Verification Status Changed (verified=false / declined)",
+    "captured_at": "2026-04-25",
+    "notes": "Verified=false means the merchant did not pass KYC. Plugin should NOT write merchantId or flip payoutsEnabled. No real credentials."
+  },
+  "Url": "https://demo-api.vivapayments.com/viva/webhook",
+  "EventData": {
+    "Verified": false,
+    "PersonId": "ffffffff-0000-1111-2222-444444444444",
+    "PlatformPersonId": "a1a1a1a1-a1a1-a1a1-a1a1-a1a1a1a1a1a1",
+    "ConnectedAccountId": "eeeeeeee-ffff-0000-1111-333333333333"
+  },
+  "Created": "2026-04-25T09:00:00.000Z",
+  "CorrelationId": "77777777-8888-9999-aaaa-bbbbbbbbbbbb",
+  "EventTypeId": 8194,
+  "Delay": null,
+  "MessageId": "b3e91f42-cc10-4d88-9123-ab45ef678901",
+  "RecipientId": "a1a1a1a1-a1a1-a1a1-a1a1-a1a1a1a1a1a1",
+  "MessageTypeId": 512,
+  "RetryCount": 0,
+  "RetryDelayInSeconds": null
+}

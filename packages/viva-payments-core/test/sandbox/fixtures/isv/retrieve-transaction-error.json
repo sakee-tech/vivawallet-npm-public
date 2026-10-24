@@ -1,0 +1,24 @@
+{
+  "_meta": {
+    "scenario": "Retrieve transaction — StatusId=E (Error/failed)",
+    "doc_ref": "references/viva-docs/md/wh-transaction-failed.txt:162",
+    "captured_at": "2026-04-25",
+    "notes": "Failed payment. ResponseEventId=3001 indicates card declined. Maps to plugin status='failed' (P17)."
+  },
+  "transactionId": "aaaaaaaa-1111-2222-3333-dddddddddddd",
+  "orderCode": "1234567890123456",
+  "statusId": "E",
+  "amount": 9999,
+  "currencyCode": "978",
+  "merchantId": "cccccccc-dddd-eeee-ffff-000000000001",
+  "parentId": null,
+  "insDate": "2026-04-25T09:58:00.000Z",
+  "transactionTypeId": 5,
+  "cardNumber": "414746XXXXXX0133",
+  "cardTypeId": 0,
+  "email": "customer@example.com",
+  "fullName": "Test Customer",
+  "merchantTrns": "pay_s11_test_001",
+  "customerTrns": "Payment via Viva Wallet",
+  "connectedAccountId": "eeeeeeee-ffff-0000-1111-222222222222"
+}
