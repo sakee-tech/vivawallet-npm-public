@@ -1,0 +1,290 @@
+/**
+ * route.ts — Viva Wallet webhook endpoint.
+ *
+ * Two handlers:
+ *   GET  /viva/webhook  — challenge-response for URL registration.
+ *   POST /viva/webhook  — event ingest: IP check, INSERT + emit.
+ *
+ * Security model (plan P7):
+ *   (a) IP allowlist   — 403 on mismatch. Source IP is extracted with
+ *                        trustedProxyDepth-bounded X-Forwarded-For walking
+ *                        (CSO Finding #2). Configure via
+ *                        VIVA_TRUSTED_PROXY_DEPTH (default 0 = socket only).
+ *   (b) DB dedup       — INSERT ... ON CONFLICT (message_id) DO NOTHING.
+ *   (c) A2 gate        — only emit 'viva.webhook.received' when RETURNING non-empty.
+ *
+ * No HMAC / body-signature check: Viva does not sign payment webhooks. Auth is
+ * the IP allowlist (a) plus the GET URL-verification handshake at registration.
+ *
+ * Metrics emitted (P16):
+ *   viva_webhook_received_total{event_type_id, result}
+ *   viva_webhook_processing_lag_seconds
+ *   viva_tenant_resolution_failures_total
+ *   viva_webhook_ordercode_mismatch_total
+ *
+ * @see references/viva-docs/md/webhooks-for-payments.txt:270 (IP allowlist)
+ * @see references/viva-docs/md/webhooks-for-payments.txt:254 (security model P7)
+ * @see docs/TODO-CSO.md (Findings 1, 2, 3)
+ */
+
+import type { MedusaRequest, MedusaResponse } from '@medusajs/framework/http';
+import { Modules } from '@medusajs/framework/utils';
+import type { IEventBusModuleService } from '@medusajs/types';
+import pg from 'pg';
+import {
+  isAllowedSourceIp,
+  isTransactionEvent,
+  isOnboardingEvent,
+  extractClientIp as extractClientIpCore,
+} from '@sakeetech/viva-payments-core/webhooks';
+import type { VivaWebhookEnvelope } from '@sakeetech/viva-payments-core/types';
+import { getSharedMetrics } from '../../../observability/index.js';
+import { resolveVivaConfig } from '../../../container.js';
+
+// ---------------------------------------------------------------------------
+// GET — challenge-response
+// ---------------------------------------------------------------------------
+
+/**
+ * Challenge-response for webhook URL registration.
+ * Returns `{"Key": "<webhook_verification_key>"}` per Viva protocol.
+ * No auth gate; only exercised at deployment time.
+ *
+ * @see references/viva-docs/md/webhooks-for-payments.txt:284 (challenge response)
+ */
+export const GET = async (
+  req: MedusaRequest,
+  res: MedusaResponse,
+): Promise<void> => {
+  // Config registered by the plugin loader at boot (#21 — never read process.env at request time).
+  const config = resolveVivaConfig(req.scope);
+  const key = config?.webhookVerificationKey ?? '';
+  if (!key) {
+    res.status(500).json({ error: 'VIVA_WEBHOOK_VERIFICATION_KEY is not configured' });
+    return;
+  }
+  res.setHeader('Cache-Control', 'no-store');
+  res.status(200).json({ Key: key });
+};
+
+// ---------------------------------------------------------------------------
+// POST — event ingest
+// ---------------------------------------------------------------------------
+
+/**
+ * POST event ingest handler.
+ *
+ * Steps:
+ *   1. IP allowlist check (env-configured). 403 on rejection.
+ *   2. Read rawBody captured by vivaWebhookRawBodyMiddleware.
+ *   3. Parse JSON.
+ *   4. Resolve tenant via viva_tenant_merchant.
+ *   5. INSERT INTO viva_webhook_event ... ON CONFLICT (message_id) DO NOTHING RETURNING viva_webhook_event_id.
+ *   6. A2: only emit 'viva.webhook.received' when RETURNING produced a row.
+ *   7. Always respond 200.
+ *
+ * @see references/viva-docs/md/webhooks-for-payments.txt:286 (POST flow)
+ * @see references/viva-docs/md/wh-transaction-payment-created.txt:158 (event envelope)
+ */
+export const POST = async (
+  req: MedusaRequest,
+  res: MedusaResponse,
+): Promise<void> => {
+  // Config registered by the plugin loader at boot (#21 — never read process.env at request time).
+  const config = resolveVivaConfig(req.scope);
+  const environment = (config?.environment ?? 'demo') as 'demo' | 'production';
+  const extraAllowlist: readonly string[] = config?.webhookIpAllowlist ?? [];
+  const trustedProxyDepth: number = config?.trustedProxyDepth ?? 0;
+  const metrics = getSharedMetrics();
+
+  // ---- Step 1: IP allowlist (CSO Finding #2) ----
+  // VIVA_TRUSTED_PROXY_DEPTH controls how many trailing X-Forwarded-For hops we
+  // trust. Default 0 = socket only (safe for direct exposure); set to 1 for a
+  // single reverse proxy, 2 for CDN+LB. Walking from the rightmost end means
+  // attacker-injected leftmost values are ignored.
+  const clientIp = extractClientIpCore(req, trustedProxyDepth);
+  if (!isAllowedSourceIp(clientIp, environment, extraAllowlist)) {
+    // Log metric for IP rejection but only 403 in non-dev environments.
+    // In dev/test with IP_ALLOWLIST_BYPASS=true, allow through.
+    if (config?.webhookIpAllowlistBypass !== true) {
+      req.scope?.resolve?.('logger')?.warn?.(
+        `[viva] Rejected webhook from disallowed IP ${clientIp} (env=${environment})`,
+      );
+      metrics.counter('viva_webhook_received_total', { event_type_id: 'unknown', result: 'ip_rejected' });
+      res.status(403).json({ error: 'Forbidden' });
+      return;
+    }
+  }
+
+  // ---- Step 2: Raw body ----
+  const rawBody: Buffer = req.rawBody as Buffer;
+  if (!rawBody || rawBody.length === 0) {
+    res.status(200).end();
+    return;
+  }
+
+  // ---- Step 3: Parse JSON ----
+  let envelope: VivaWebhookEnvelope;
+  try {
+    envelope = JSON.parse(rawBody.toString('utf-8')) as VivaWebhookEnvelope;
+  } catch {
+    // Malformed JSON — return 200 per plan (Viva retries are not helpful here)
+    const logger = req.scope?.resolve?.('logger') as { error?: (msg: string) => void } | undefined;
+    logger?.error?.('[viva] Webhook POST: failed to parse JSON body');
+    res.status(200).end();
+    return;
+  }
+
+  const eventTypeId = envelope.EventTypeId;
+  const messageId = envelope.MessageId;
+
+  // ---- Compute processing lag (P16) ----
+  // envelope.Created is an ISO8601 timestamp when present
+  const createdTs = (envelope as unknown as Record<string, unknown>)['Created'];
+  if (typeof createdTs === 'string') {
+    const createdMs = new Date(createdTs).getTime();
+    if (!isNaN(createdMs)) {
+      const lagSeconds = (Date.now() - createdMs) / 1000;
+      metrics.histogram('viva_webhook_processing_lag_seconds', lagSeconds);
+    }
+  }
+
+  // ---- Step 4: Resolve tenant ----
+  // No HMAC step: Viva does not sign payment webhooks. Inbound auth is the IP
+  // allowlist (Step 1) plus the GET URL-verification handshake at registration.
+  const connString = process.env['DATABASE_URL'] ??
+    `postgresql://${process.env['USER'] ?? 'postgres'}@localhost:5432/postgres`;
+
+  const pool = new pg.Pool({ connectionString: connString, max: 1 });
+  const logger = req.scope?.resolve?.('logger') as {
+    info?: (msg: string) => void;
+    warn?: (msg: string) => void;
+    error?: (msg: string) => void;
+  } | undefined;
+
+  let tenantId: string | null = null;
+  let vivaMerchantId: string | null = null;
+  let connectedAccountId: string | null = null;
+  let transactionId: string | null = null;
+
+  try {
+    const eventData = envelope.EventData as unknown as Record<string, unknown>;
+
+    if (isTransactionEvent(eventTypeId)) {
+      const txData = eventData as unknown as { MerchantId?: string; TransactionId?: string; ConnectedAccountId?: string | null };
+      vivaMerchantId = txData.MerchantId ?? null;
+      transactionId = txData.TransactionId ?? null;
+      connectedAccountId = txData.ConnectedAccountId ?? null;
+
+      if (vivaMerchantId) {
+        const client = await pool.connect();
+        try {
+          const row = await client.query<{ tenant_id: string }>(
+            `SELECT tenant_id FROM viva_tenant_merchant WHERE viva_merchant_id = $1 LIMIT 1`,
+            [vivaMerchantId],
+          );
+          tenantId = row.rows[0]?.tenant_id ?? null;
+        } finally {
+          client.release();
+        }
+      }
+    } else if (isOnboardingEvent(eventTypeId)) {
+      const onbData = eventData as unknown as { ConnectedAccountId?: string };
+      connectedAccountId = onbData.ConnectedAccountId ?? null;
+
+      if (connectedAccountId) {
+        const client = await pool.connect();
+        try {
+          const row = await client.query<{ tenant_id: string }>(
+            `SELECT tenant_id FROM viva_tenant_merchant WHERE connected_account_id = $1 LIMIT 1`,
+            [connectedAccountId],
+          );
+          tenantId = row.rows[0]?.tenant_id ?? null;
+        } finally {
+          client.release();
+        }
+      }
+    }
+
+    if (!tenantId) {
+      // A6: log metric but continue — INSERT with tenant_id=NULL
+      logger?.warn?.(
+        `[viva] Tenant resolution failed for event ${eventTypeId} message ${messageId} ` +
+        `vivaMerchantId=${vivaMerchantId ?? 'null'} connectedAccountId=${connectedAccountId ?? 'null'}. ` +
+        `Metric: viva_tenant_resolution_failures_total`,
+      );
+      metrics.counter('viva_tenant_resolution_failures_total', { event_type_id: String(eventTypeId) });
+    }
+
+    // ---- Step 5: INSERT ... ON CONFLICT DO NOTHING RETURNING ----
+    const client = await pool.connect();
+    let insertedEventId: string | null = null;
+    try {
+      const result = await client.query<{ viva_webhook_event_id: string }>(
+        `INSERT INTO viva_webhook_event
+           (transaction_id, event_type_id, message_id, viva_merchant_id, connected_account_id, raw_payload)
+         VALUES ($1, $2, $3, $4, $5, $6)
+         ON CONFLICT (message_id) DO NOTHING
+         RETURNING viva_webhook_event_id`,
+        [
+          transactionId,
+          eventTypeId,
+          messageId,
+          vivaMerchantId,
+          connectedAccountId,
+          JSON.stringify(envelope),
+        ],
+      );
+      insertedEventId = result.rows[0]?.viva_webhook_event_id ?? null;
+    } finally {
+      client.release();
+    }
+
+    // ---- Step 6: A2 dispatch gate — only emit when RETURNING returned a row ----
+    if (insertedEventId) {
+      metrics.counter('viva_webhook_received_total', {
+        event_type_id: String(eventTypeId),
+        result: tenantId ? 'accepted' : 'tenant_unresolved',
+      });
+
+      const eventBus = req.scope?.resolve?.(Modules.EVENT_BUS) as IEventBusModuleService | null;
+      if (eventBus) {
+        await eventBus.emit({
+          name: 'viva.webhook.received',
+          data: {
+            eventId: insertedEventId,
+            tenantId: tenantId,
+            eventTypeId,
+            transactionId,
+            vivaMerchantId,
+            connectedAccountId,
+          },
+        });
+      }
+    } else {
+      // Duplicate — ON CONFLICT hit
+      metrics.counter('viva_webhook_received_total', {
+        event_type_id: String(eventTypeId),
+        result: 'duplicate',
+      });
+    }
+  } catch (err) {
+    logger?.error?.(
+      `[viva] Webhook POST error for message ${messageId}: ${err instanceof Error ? err.message : String(err)}`,
+    );
+    // Still return 200 so Viva doesn't retry unnecessarily
+  } finally {
+    await pool.end().catch(() => undefined);
+  }
+
+  // ---- Step 7: Always 200 ----
+  res.status(200).end();
+};
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+// (parseExtraAllowlist / parseTrustedProxyDepth moved to config.ts at #21 —
+// the parsed values now live on VivaPluginConfig and are resolved from
+// req.scope instead of being read from process.env at request time.)

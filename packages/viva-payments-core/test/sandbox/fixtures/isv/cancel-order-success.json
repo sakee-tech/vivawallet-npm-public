@@ -1,0 +1,12 @@
+{
+  "_meta": {
+    "scenario": "Successful order cancellation for an unpaid order",
+    "doc_ref": "docs/internal/payment-isv-api.yaml:1030-1041 (ISV_Cancel_Order 200 example)",
+    "captured_at": "2026-04-25",
+    "notes": "DELETE /api/orders/{orderCode} on the legacy host (Basic auth). Success = Success:true / ErrorCode:0. Idempotent — re-cancel returns 200. Fields are PascalCase per the spec sample."
+  },
+  "OrderCode": "1234567890123456",
+  "ErrorCode": 0,
+  "ErrorText": null,
+  "Success": true
+}

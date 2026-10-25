@@ -1,0 +1,10 @@
+{
+  "_meta": {
+    "scenario": "OAuth2 token fetch rejected — invalid client credentials",
+    "doc_ref": "references/viva-docs/md/oauth2-authentication.txt:179",
+    "captured_at": "2026-04-25",
+    "notes": "Returned when client_id or client_secret is wrong. HTTP status 401."
+  },
+  "error": "invalid_client",
+  "error_description": "Client authentication failed"
+}

@@ -1,0 +1,10 @@
+{
+  "_meta": {
+    "scenario": "Retrieve Transaction — 404 Not Found (error response shape)",
+    "captured_at": "2026-04-25",
+    "notes": "Returned when the transactionId does not exist. Plugin maps this to VIVA_ORDER_NOT_FOUND. No real credentials."
+  },
+  "ErrorCode": 404,
+  "ErrorText": "Transaction not found",
+  "Messages": []
+}
