@@ -1,0 +1,15 @@
+{
+  "_meta": {
+    "scenario": "Partial refund over the cumulative cap rejected (4th GBP 3 refund of a GBP 10 payment)",
+    "doc_ref": "docs/internal/payment-isv-api.yaml (DELETE /api/transactions/{transactionId})",
+    "captured_at": "2026-10-24",
+    "notes": "Probe-captured (scripts/viva-refund-cap-probe.ts, scenario B call 4, ISV reseller Basic, demo); all-null fields trimmed. HTTP 200, StatusId E, ErrorCode 403."
+  },
+  "Amount": null,
+  "StatusId": "E",
+  "TransactionId": null,
+  "ErrorCode": 403,
+  "ErrorText": "PaymentsRefundFailedTotalAmountExceeded: Request to refund the transaction with id 84e14920-59c0-4210-a394-bffa04f841cd aborted. Initial amount: 10.00 total refund amount: 12.00",
+  "EventId": 2066,
+  "Success": false
+}

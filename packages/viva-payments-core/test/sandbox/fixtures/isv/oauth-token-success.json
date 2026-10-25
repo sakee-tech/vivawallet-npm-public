@@ -1,0 +1,12 @@
+{
+  "_meta": {
+    "scenario": "Successful OAuth2 client_credentials token fetch",
+    "doc_ref": "references/viva-docs/md/oauth2-authentication.txt:179",
+    "captured_at": "2026-04-25",
+    "notes": "Standard 3600s bearer token. access_token is a dummy JWT-shaped string safe for test use."
+  },
+  "access_token": "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJ0ZXN0LWNsaWVudC1pZCIsInNjb3BlIjoicGF5bWVudHMiLCJleHAiOjE3NDU2OTAwMDAsImlhdCI6MTc0NTY4NjQwMH0.SANDBOX_DUMMY_SIGNATURE",
+  "expires_in": 3600,
+  "token_type": "Bearer",
+  "scope": "payments"
+}

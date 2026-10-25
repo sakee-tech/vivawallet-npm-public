@@ -1,0 +1,23 @@
+{
+  "_meta": {
+    "scenario": "Vendure — Webhook EventTypeId=4865 Order Updated (user cancel via Smart Checkout back button)",
+    "source": "Adapted from viva-payments-core sandbox fixtures",
+    "captured_at": "2026-04-25",
+    "notes": "StatusId=X indicates user-cancelled. Plugin maps X/C/E to cancel flow. No real credentials."
+  },
+  "Url": "https://demo-api.vivapayments.com/viva/webhook",
+  "EventData": {
+    "OrderCode": "1234567890123456",
+    "StatusId": "X",
+    "MerchantId": "cccccccc-dddd-eeee-ffff-000000000001"
+  },
+  "Created": "2026-04-25T10:05:00.000Z",
+  "CorrelationId": "44444444-5555-6666-7777-888888888888",
+  "EventTypeId": 4865,
+  "Delay": null,
+  "MessageId": "8c6caf37-ef44-44eb-8fe2-cf11960ccd2e",
+  "RecipientId": "a1a1a1a1-a1a1-a1a1-a1a1-a1a1a1a1a1a1",
+  "MessageTypeId": 512,
+  "RetryCount": 0,
+  "RetryDelayInSeconds": null
+}

@@ -1,0 +1,1 @@
+{"version":3,"file":"index.d.ts","sourceRoot":"","sources":["../../src/refunds/index.ts"],"names":[],"mappings":"AAAA;;;;;;;;;;;;;GAaG;AAEH,OAAO,EAAE,gBAAgB,EAAE,MAAM,yBAAyB,CAAC;AAC3D,YAAY,EACV,sBAAsB,EACtB,iBAAiB,EACjB,kBAAkB,GACnB,MAAM,yBAAyB,CAAC;AAEjC,OAAO,EAAE,qBAAqB,EAAE,MAAM,eAAe,CAAC;AACtD,YAAY,EAAE,cAAc,EAAE,aAAa,EAAE,cAAc,EAAE,MAAM,eAAe,CAAC"}

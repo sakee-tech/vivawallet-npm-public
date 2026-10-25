@@ -1,0 +1,9 @@
+{
+  "_meta": {
+    "scenario": "List registered webhooks — no webhooks registered yet",
+    "doc_ref": "references/viva-docs/md/webhooks-for-payments.txt:270",
+    "captured_at": "2026-04-25",
+    "notes": "GET /api/ms/v2/isv/webhooks response when no webhooks are registered. Used by the CLI idempotency check (P12)."
+  },
+  "webhooks": []
+}
