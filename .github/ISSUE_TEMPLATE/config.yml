@@ -1,0 +1,9 @@
+# Force template use — no blank free-form issues.
+blank_issues_enabled: false
+contact_links:
+  - name: 🔒 Report a security vulnerability
+    url: https://github.com/sakee-tech/vivawallet-npm-public/security/advisories/new
+    about: Do NOT open a public issue for security problems. Use private vulnerability reporting.
+  - name: 📦 npm — viva-payments-core
+    url: https://www.npmjs.com/package/@sakeetech/viva-payments-core
+    about: Package page, versions, and install instructions.

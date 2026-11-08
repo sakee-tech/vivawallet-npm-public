@@ -1,0 +1,1639 @@
+/**
+ * payment-method-handler.ts — Vendure PaymentMethodHandler for Viva Wallet ISV.
+ *
+ * Handler code: 'viva'
+ * Storefront calls: addPaymentToOrder({ method: 'viva' })
+ * Plan state contract: createPayment returns 'Created' (D3, §2)
+ *
+ * @see docs/plans/vendure-plugin-v0.md §"API Surface — PaymentMethodHandler operations"
+ * @see docs/plans/vendure-plugin-v0.md §"Architecture Decisions D3 + D5 + D11"
+ */
+
+import { PaymentMethodHandler, Logger, LanguageCode } from '@vendure/core';
+import type { ID, Injector, Refund, RequestContext } from '@vendure/core';
+import { IsvHttpClient, connectionRetryAllowed } from '@sakeetech/viva-payments-core/isv';
+import { Payments } from '@sakeetech/viva-payments-core/payments';
+import { BasicAuthClient } from '@sakeetech/viva-payments-core/legacy';
+import { describeVivaRejection, redactIds } from '@sakeetech/viva-payments-core/observability';
+import {
+  FastRefundClient,
+  resolveRefundStrategy,
+} from '@sakeetech/viva-payments-core/refunds';
+import {
+  VivaApiError,
+  VivaAuthError,
+} from '@sakeetech/viva-payments-core/errors';
+import type { MerchantId, OrderCode, TransactionId } from '@sakeetech/viva-payments-core/types';
+import type {
+  VivaPaymentPluginOptions,
+  VivaMerchantOptions,
+} from './types.js';
+import type { VivaOAuth2Strategy } from './providers/viva-oauth2-strategy.provider.js';
+import { StateMachineService } from './services/state-machine.service.js';
+import type { RefundAttemptNote } from './services/state-machine.service.js';
+import type { VivaTransaction } from './entities/viva-transaction.entity.js';
+import { VivaPluginError, describeError } from './util/error-envelope.js';
+import { classifyCancel } from './util/cancel-guard.js';
+import { alphaToNumeric } from './util/currency.js';
+import { substitute } from './util/url-template.js';
+import {
+  VIVA_PLUGIN_OPTIONS,
+  VIVA_OAUTH2_STRATEGY_TOKEN,
+  VIVA_LOG_CONTEXT,
+} from './constants.js';
+
+// ---------------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------------
+
+/** Latency log threshold in ms — log warning when Viva call exceeds this. */
+const VIVA_LATENCY_WARN_MS = 1200;
+
+/**
+ * Default Smart Checkout source code used when neither the channel custom
+ * field `vivaSourceCode` nor `config.sourceCode` (merchant mode) is set.
+ *
+ * @see references/viva-docs/md/payment-source-for-isv.txt:101
+ */
+const DEFAULT_SOURCE_CODE = 'Default';
+
+/**
+ * Viva createOrder field length limits (per the create-order OpenAPI body).
+ * Values are clamped before transmission so an over-long order code or name
+ * never trips a 400.
+ *
+ * MERCHANT_TRNS_MAX is order-create only. The refund DELETE takes the full
+ * idempotency key as merchantTrns, unclamped: no documented max, and Viva demo
+ * accepted and echoed 60 chars untruncated
+ * (logs/refund-cap-probe/2026-10-25T14-11-05-253Z). A clamped tag could not be
+ * matched on reconcile (#2).
+ */
+const MERCHANT_TRNS_MAX = 50;
+const CUSTOMER_TRNS_MAX = 255;
+const CUSTOMER_FULL_NAME_MAX = 100;
+
+// ---------------------------------------------------------------------------
+// Module-level singletons (set in init)
+// ---------------------------------------------------------------------------
+
+let _options: VivaPaymentPluginOptions | undefined;
+let _oauth2: VivaOAuth2Strategy | undefined;
+let _stateMachine: StateMachineService | undefined;
+
+/**
+ * Build the mode-aware `Payments` client.
+ *
+ * In merchant mode the URL paths emitted by `Payments` do NOT include the
+ * `/isv` segment and do NOT carry `merchantId={uuid}` as a query parameter.
+ * The class silently ignores `opts.merchantId` when constructed with
+ * `mode: 'merchant'` — adapter call sites may pass either undefined or the
+ * configured `legacyMerchantId` and behaviour is identical.
+ *
+ * @see docs/plans/multi-mode-v0.md §9
+ */
+function buildPaymentsClient(
+  options: VivaPaymentPluginOptions,
+  oauth2: VivaOAuth2Strategy,
+): Payments {
+  const client = new IsvHttpClient({
+    environment: options.environment,
+    authStrategy: oauth2,
+  });
+  // Merchant Basic client for `Payments.refundPayment` (Standard refund:
+  // DELETE /api/transactions/{id} on the legacy host). MERCHANT MODE ONLY — in
+  // ISV mode there are no Merchant Basic creds and the refund builds a
+  // reseller-variant client per-call, so leave this undefined.
+  // @see docs/internal/payment-isv-api.yaml:2650
+  const legacyClient = options.mode === 'merchant' ? buildLegacyClient(options) : undefined;
+  return new Payments({
+    mode: options.mode,
+    client,
+    ...(legacyClient !== undefined ? { legacyClient } : {}),
+  });
+}
+
+/**
+ * Build the merchant-variant legacy Basic-auth client.
+ *
+ * Used as the construction-time `legacyClient` on `Payments` for MERCHANT mode
+ * (Standard refund + webhook-key fetch). ISV-mode refunds do NOT use this — they
+ * build a reseller-variant client per-refund via {@link buildResellerLegacyClient}.
+ *
+ * @see docs/AUTH.md §6.2
+ */
+function buildLegacyClient(options: VivaPaymentPluginOptions): BasicAuthClient {
+  return new BasicAuthClient({
+    authVariant: 'merchant',
+    environment: options.environment,
+    merchantId: options.legacyMerchantId,
+    apiKey: options.legacyApiKey,
+  });
+}
+
+/**
+ * Build a reseller-variant legacy Basic-auth client scoped to ONE connected
+ * merchant, for the ISV Standard refund (`DELETE /api/transactions/{id}`).
+ *
+ * The Basic credential is `base64(resellerId:connectedMerchantId:resellerApiKey)`
+ * — the `merchantId` slot is the *connected merchant's* UUID (from the
+ * transaction), NOT `options.reseller.merchantId`. The reseller creds are the
+ * Viva-issued pair (demo/production differ), distinct from dashboard ISV creds.
+ *
+ * @see docs/internal/payment-isv-api.yaml:2650 (reseller auth structure)
+ */
+function buildResellerLegacyClient(
+  reseller: { resellerId: string; resellerApiKey: string },
+  environment: VivaPaymentPluginOptions['environment'],
+  connectedMerchantId: string,
+): BasicAuthClient {
+  return new BasicAuthClient({
+    authVariant: 'reseller',
+    environment,
+    resellerId: reseller.resellerId,
+    merchantId: connectedMerchantId,
+    resellerApiKey: reseller.resellerApiKey,
+  });
+}
+
+/**
+ * Build a `FastRefundClient` bound to the OAuth2 acquiring scope.
+ *
+ * In merchant mode the refund handler uses this client when the resolved
+ * strategy is `'fast'`. ISV mode does not use Fast Refund in slice B — kept
+ * adjacent so future ISV adoption is one config change away.
+ *
+ * @see docs/ENDPOINTS.md §4
+ */
+function buildFastRefundClient(
+  options: VivaPaymentPluginOptions,
+  oauth2: VivaOAuth2Strategy,
+): FastRefundClient {
+  const client = new IsvHttpClient({
+    environment: options.environment,
+    authStrategy: oauth2,
+  });
+  return new FastRefundClient({ client });
+}
+
+function getIsvPayments(): Payments {
+  if (_isvPaymentsOverride) return _isvPaymentsOverride;
+  if (!_oauth2 || !_options) {
+    throw VivaPluginError.internalError('VivaPaymentMethodHandler not initialised. Did you call init()?');
+  }
+  return buildPaymentsClient(_options, _oauth2);
+}
+
+function getFastRefundClient(): FastRefundClient {
+  if (_fastRefundOverride) return _fastRefundOverride;
+  if (!_oauth2 || !_options) {
+    throw VivaPluginError.internalError('VivaPaymentMethodHandler not initialised. Did you call init()?');
+  }
+  return buildFastRefundClient(_options, _oauth2);
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * Resolve the Viva merchantId for the current channel.
+ *
+ * - ISV mode: reads `resolveMerchantId(ctx)` or `channel.customFields.vivaMerchantId`.
+ * - Merchant mode: returns `undefined` — there is no per-channel tenant. The
+ *   `Payments` client ignores `opts.merchantId` when constructed with
+ *   `mode: 'merchant'`, so adapter-level callers may still pass through.
+ */
+function resolveMerchantId(
+  options: VivaPaymentPluginOptions,
+  ctx: RequestContext,
+): MerchantId | undefined {
+  if (options.mode !== 'isv') return undefined;
+  const raw: string | undefined = options.resolveMerchantId
+    ? options.resolveMerchantId(ctx as any)
+    : ((ctx.channel.customFields as Record<string, unknown>)['vivaMerchantId'] as string | undefined);
+  return raw as MerchantId | undefined;
+}
+
+/**
+ * Resolve the Smart Checkout sourceCode.
+ *
+ * Resolution order (both modes): channel custom field `vivaSourceCode` →
+ * mode-specific fallback.
+ *
+ * - ISV mode: optional `resolveSourceCode(ctx)` override; default `'Default'`.
+ * - Merchant mode: `config.sourceCode ?? 'Default'`.
+ *
+ * `vivaSourceCode` is registered as a channel custom field in both modes per
+ * the multi-mode plan — it is the ONE field that retains meaning in merchant
+ * mode (operator can override per-channel without code changes).
+ */
+function resolveSourceCode(
+  options: VivaPaymentPluginOptions,
+  ctx: RequestContext,
+): string {
+  // Per-channel override applies in both modes — drop in if operator set it.
+  const channelOverride = (ctx.channel.customFields as Record<string, unknown>)['vivaSourceCode'] as
+    | string
+    | undefined;
+  if (channelOverride) return channelOverride;
+
+  if (options.mode === 'isv') {
+    if (options.resolveSourceCode) return options.resolveSourceCode(ctx as any);
+    return DEFAULT_SOURCE_CODE;
+  }
+  // merchant mode
+  return options.sourceCode ?? DEFAULT_SOURCE_CODE;
+}
+
+/**
+ * Resolve the ISV platform fee (minor units) for an order.
+ *
+ * - ISV mode: defaults to 0, override via `resolveIsvAmount`.
+ * - Merchant mode: always 0 (no ISV concept — the wire body strips the field
+ *   entirely in merchant mode, so the returned value is irrelevant beyond the
+ *   pre-call guard).
+ */
+function resolveIsvAmount(
+  options: VivaPaymentPluginOptions,
+  order: { totalWithTax: number; currencyCode: string; id: string | number; code: string; state: string },
+  ctx: RequestContext,
+): number {
+  if (options.mode !== 'isv') return 0;
+  if (options.resolveIsvAmount) return options.resolveIsvAmount(order as any, ctx as any);
+  return 0;
+}
+
+function resolveSuccessUrl(options: VivaPaymentPluginOptions, ctx: RequestContext): string {
+  return typeof options.successUrl === 'function' ? options.successUrl(ctx as any) : options.successUrl;
+}
+
+function resolveFailureUrl(options: VivaPaymentPluginOptions, ctx: RequestContext): string {
+  return typeof options.failureUrl === 'function' ? options.failureUrl(ctx as any) : options.failureUrl;
+}
+
+/**
+ * Resolve the optional Smart Checkout theme color.
+ *
+ * - ISV mode: optional `resolveCheckoutColor(ctx)` callback.
+ * - Merchant mode: optional `config.checkoutColor` string.
+ */
+function resolveCheckoutColor(
+  options: VivaPaymentPluginOptions,
+  ctx: RequestContext,
+): string | undefined {
+  if (options.mode === 'isv') return options.resolveCheckoutColor?.(ctx as any);
+  return options.checkoutColor;
+}
+
+/** Order shape carrying the relations Vendure loads for createPayment. */
+type OrderWithCustomer = {
+  code: string;
+  customer?: {
+    emailAddress?: string | null;
+    firstName?: string | null;
+    lastName?: string | null;
+    phoneNumber?: string | null;
+  } | null;
+};
+
+/**
+ * Build the Viva createOrder identity fields from the Vendure order.
+ *
+ * The order passed into `createPayment` is loaded with its `customer` relation
+ * (OrderService.getOrderOrThrow default relations include `'customer'`), so the
+ * customer scalars are available without an extra query. All fields are
+ * conditionally included (omitted when absent) and length-clamped to the Viva
+ * createOrder limits. The core `Payments` client maps the typed names to the
+ * wire body (`customerEmail → email`, `customerPhone → phone`,
+ * `customerFullName → fullName`; `merchantTrns`/`customerTrns` pass through).
+ *
+ * - `merchantTrns` ← `order.code` (always; merchant-facing, echoed in webhooks
+ *   as `EventData.MerchantTrns` for reconciliation cross-checks).
+ * - `customerTrns` ← `resolveCustomerTrns(order, ctx)` or `Order <code>`.
+ * - `customerEmail`/`customerFullName`/`customerPhone` ← order.customer (when set).
+ *
+ * @see references/viva-docs/md/isv-partner-program.txt:104 (create-order body)
+ */
+function buildOrderIdentity(
+  options: VivaPaymentPluginOptions,
+  order: OrderWithCustomer,
+  ctx: RequestContext,
+): {
+  merchantTrns: string;
+  customerTrns: string;
+  customerEmail?: string;
+  customerFullName?: string;
+  customerPhone?: string;
+} {
+  const customerTrnsRaw = options.resolveCustomerTrns
+    ? options.resolveCustomerTrns(order as any, ctx as any)
+    : `Order ${order.code}`;
+
+  const identity: {
+    merchantTrns: string;
+    customerTrns: string;
+    customerEmail?: string;
+    customerFullName?: string;
+    customerPhone?: string;
+  } = {
+    merchantTrns: order.code.slice(0, MERCHANT_TRNS_MAX),
+    customerTrns: customerTrnsRaw.slice(0, CUSTOMER_TRNS_MAX),
+  };
+
+  const customer = order.customer;
+  if (customer) {
+    if (customer.emailAddress) identity.customerEmail = customer.emailAddress;
+    const fullName = `${customer.firstName ?? ''} ${customer.lastName ?? ''}`.trim();
+    if (fullName) identity.customerFullName = fullName.slice(0, CUSTOMER_FULL_NAME_MAX);
+    if (customer.phoneNumber) identity.customerPhone = customer.phoneNumber;
+  }
+
+  return identity;
+}
+
+/**
+ * Stable idempotency key for (channelId, orderId, amountMinor, currencyCode).
+ * D11: used as both Idempotency-Key header value and pending-row lookup key.
+ * Vendure does NOT expose a real paymentId inside createPayment — orderId is
+ * the closest stable identifier available at that point.
+ *
+ * TODO(impl): If a future Vendure version passes the payment ID into createPayment,
+ * switch to (channelId, paymentId) here.
+ */
+function buildIdempotencyKey(channelId: string | number, orderId: string | number, amountMinor: number, currencyCode: string): string {
+  return `viva:${channelId}:${orderId}:${amountMinor}:${currencyCode}`;
+}
+
+/**
+ * Build the Smart Checkout redirect URL.
+ * Demo: https://demo.vivapayments.com/web/checkout?ref={orderCode}
+ * Production: https://www.vivapayments.com/web/checkout?ref={orderCode}
+ */
+function buildCheckoutUrl(environment: 'demo' | 'production', orderCode: bigint, color?: string): string {
+  const host = environment === 'production' ? 'www.vivapayments.com' : 'demo.vivapayments.com';
+  let url = `https://${host}/web/checkout?ref=${orderCode}`;
+  if (color) {
+    url += `&color=${color.replace(/^#/, '')}`;
+  }
+  return url;
+}
+
+/** Map a VivaApiError to VivaPluginError.apiError with conditional fields. */
+function mapApiError(err: VivaApiError): never {
+  // Viva's message can name the merchant id (#30); keep the reason, drop ids.
+  const message = redactIds(err.message);
+  const opts: Parameters<typeof VivaPluginError.apiError>[0] = { message };
+  if (err.vivaCode !== undefined) opts.vivaErrorCode = Number(err.vivaCode);
+  if (message) opts.vivaErrorMessage = message;
+  opts.cause = err;
+  throw VivaPluginError.apiError(opts);
+}
+
+/** Returns true when the error indicates a Viva-side 5xx / auth / network failure. */
+function isRetryableVivaError(err: unknown): err is VivaAuthError | VivaApiError {
+  if (err instanceof VivaAuthError) return true;
+  if (err instanceof VivaApiError && err.httpStatus !== undefined && err.httpStatus >= 500) return true;
+  return false;
+}
+
+// ---------------------------------------------------------------------------
+// Test injection — allows unit tests to bypass NestJS DI
+// ---------------------------------------------------------------------------
+
+/** @internal Test-only: inject dependencies without NestJS DI. */
+export function _testInjectDeps(opts: {
+  options: VivaPaymentPluginOptions;
+  oauth2: VivaOAuth2Strategy;
+  stateMachine: StateMachineService;
+  isvPayments?: Payments;
+  fastRefundClient?: FastRefundClient;
+  /** Test-only: MockAgent-backed reseller client for the ISV refund path. */
+  resellerLegacyClient?: BasicAuthClient;
+}): void {
+  _options = opts.options;
+  _oauth2 = opts.oauth2;
+  _stateMachine = opts.stateMachine as any;
+  // Always reset overrides; only set if explicitly provided.
+  _isvPaymentsOverride = opts.isvPayments;
+  _fastRefundOverride = opts.fastRefundClient;
+  _resellerLegacyClientOverride = opts.resellerLegacyClient;
+}
+
+let _isvPaymentsOverride: Payments | undefined;
+let _fastRefundOverride: FastRefundClient | undefined;
+let _resellerLegacyClientOverride: BasicAuthClient | undefined;
+
+/**
+ * Resolve the reseller-variant legacy client for an ISV refund — the test
+ * override if injected, else a freshly built client scoped to the connected
+ * merchant. @see buildResellerLegacyClient
+ */
+function getResellerLegacyClient(
+  options: VivaPaymentPluginOptions & { reseller: { resellerId: string; resellerApiKey: string } },
+  connectedMerchantId: string,
+): BasicAuthClient {
+  if (_resellerLegacyClientOverride) return _resellerLegacyClientOverride;
+  return buildResellerLegacyClient(options.reseller, options.environment, connectedMerchantId);
+}
+
+// ---------------------------------------------------------------------------
+// PaymentMethodHandler
+// ---------------------------------------------------------------------------
+
+export const vivaPaymentMethodHandler = new PaymentMethodHandler({
+  code: 'viva',
+  description: [
+    {
+      languageCode: LanguageCode.en,
+      value: 'Viva Wallet — Smart Checkout (ISV)',
+    },
+  ],
+  args: {},
+
+  // -------------------------------------------------------------------------
+  // init — resolve injected services from NestJS DI
+  // -------------------------------------------------------------------------
+  init(injector: Injector): void {
+    _options = injector.get<VivaPaymentPluginOptions>(VIVA_PLUGIN_OPTIONS);
+    _oauth2 = injector.get<VivaOAuth2Strategy>(VIVA_OAUTH2_STRATEGY_TOKEN);
+    _stateMachine = injector.get(StateMachineService);
+  },
+
+  // -------------------------------------------------------------------------
+  // createPayment
+  // -------------------------------------------------------------------------
+  async createPayment(ctx, order, amount, _args, _metadata) {
+    const options = _options!;
+    const stateMachine = _stateMachine!;
+
+    // Step 1: resolve merchantId.
+    // - ISV mode: required; resolved per channel.
+    // - Merchant mode: undefined — `Payments` ignores opts.merchantId when
+    //   constructed with mode='merchant'. We still record `legacyMerchantId`
+    //   on the stored row for ops/audit consistency.
+    const merchantId = resolveMerchantId(options, ctx);
+    if (options.mode === 'isv' && !merchantId) {
+      throw VivaPluginError.channelMisconfigured();
+    }
+
+    // Step 2: check vivaPayoutsEnabled gate — ISV-only.
+    // In merchant mode there's no onboarding flip; this custom field is
+    // meaningless and must not gate the payment.
+    if (options.mode === 'isv') {
+      const payoutsEnabled = (ctx.channel.customFields as Record<string, unknown>)['vivaPayoutsEnabled'];
+      if (payoutsEnabled === false) {
+        throw VivaPluginError.accountNotVerified();
+      }
+    }
+
+    // Step 3: resolve sourceCode (mode-aware — channel override → fallback).
+    const sourceCode = resolveSourceCode(options, ctx);
+
+    // Step 4: resolve isvAmount (always 0 in merchant mode).
+    const isvAmount = resolveIsvAmount(options, order as any, ctx);
+
+    // Step 5: isvAmount guard — only meaningful in ISV mode (merchant mode
+    // returns 0 unconditionally, so this guard never fires there).
+    if (isvAmount >= amount) {
+      throw VivaPluginError.isvAmountTooHigh(isvAmount, amount);
+    }
+
+    // Step 6: resolve checkout color (optional, mode-aware).
+    const color = resolveCheckoutColor(options, ctx);
+
+    // Step 7: resolve redirect URL templates
+    const successUrlTemplate = resolveSuccessUrl(options, ctx);
+    const failureUrlTemplate = resolveFailureUrl(options, ctx);
+
+    // Step 8+9: idempotency key & INSERT-OR-NOTHING pending row.
+    // Vendure does NOT pass a paymentId into createPayment (assigned post-return).
+    // D11 fallback: key on (channelId, orderId, amountMinor, currencyCode).
+    // orderId is used as the paymentId column proxy value.
+    const idempotencyKey = buildIdempotencyKey(ctx.channelId, order.id, amount, order.currencyCode);
+
+    // Row-stored merchant id:
+    //   ISV mode → resolved per-channel value.
+    //   Merchant mode → configured `legacyMerchantId` (ops/audit only; the wire
+    //                   call does not include merchantId in merchant mode).
+    const storedMerchantId: string =
+      options.mode === 'isv'
+        ? (merchantId as string)
+        : options.legacyMerchantId;
+
+    const { row } = await stateMachine.upsertPendingTransaction(ctx, {
+      channelId: ctx.channelId,
+      paymentId: order.id,  // proxy until real paymentId available post-return
+      idempotencyKey,
+      amountMinor: BigInt(amount),
+      currencyCode: order.currencyCode,
+      isvAmountMinor: BigInt(isvAmount),
+    });
+
+    // No reuse of a prior Viva order. A Viva Payment Order is a single-use
+    // payment intent: its StateId is a one-shot lifecycle (Pending → Expired /
+    // Canceled / Paid, all terminal — payment-isv-api.yaml:4482), and it is
+    // auto-cancelled once `paymentTimeout` elapses (yaml:6069). So once a
+    // customer declines/cancels an attempt, the order is dead — reusing its
+    // redirect (as the previous time-only `expiresAt` gate did) sends the retry
+    // straight to the hosted failure page (/web2/fail) (public #25). We follow
+    // the Vendure Mollie model and mint a fresh order on every createPayment.
+    //
+    // The local row is NOT a reuse cache — it is the vivaOrderCode → paymentId
+    // correlation record the inbound settlement webhook resolves by
+    // (findByVivaOrderCode, state-machine.service.ts). `setOrderCode` below
+    // overwrites it with the newest code on each mint; this is safe because
+    // only the winning (paid) attempt fires a success webhook, and that is
+    // always the latest mint. Declined/cancelled/expired attempts fire no
+    // success webhook, so their stale codes never need resolving.
+    //
+    // A genuine double-submit mints two orders; harmless — only one is payable
+    // and the loser auto-expires. We do NOT dedup on the row because Viva does
+    // NOT honour the createOrder Idempotency-Key header server-side anyway
+    // (probe F2 2026-04-25, docs/ENDPOINTS.md), so a row gate bought nothing.
+
+    // Step 10: call Viva createOrder.
+    // - ISV mode → POST /checkout/v2/isv/orders?merchantId={uuid} with isvAmount.
+    // - Merchant mode → POST /checkout/v2/orders (no merchantId query, no isvAmount in body).
+    // The mode branch is entirely inside the `Payments` class — adapter passes
+    // `merchantId` either way; merchant-mode Payments silently drops it.
+    const isvPayments = getIsvPayments();
+    const currencyCode = alphaToNumeric(order.currencyCode);
+
+    const callStart = Date.now();
+    let orderCode: bigint;
+    try {
+      const createOpts: { merchantId?: MerchantId; idempotencyKey: string } = {
+        idempotencyKey,
+        ...(merchantId !== undefined ? { merchantId } : {}),
+      };
+      // Customer identity + merchant reference, drawn from the order already in
+      // scope (its `customer` relation is loaded by Vendure). Tags the Viva
+      // transaction with the Vendure order code, pre-fills the Smart Checkout
+      // page, and lets Viva send its receipt + 3DS email hint. See issue #11.
+      const identity = buildOrderIdentity(options, order as unknown as OrderWithCustomer, ctx);
+
+      const response = await isvPayments.createOrder(
+        {
+          amount: BigInt(amount),
+          currencyCode,
+          sourceCode,
+          ...identity,
+          // ISV platform fee (minor units) — already resolved + guarded above.
+          // Verified against the Viva create-order OpenAPI body: `isvAmount` is
+          // "the amount paid out to the ISV partner", NOT added to `amount` but
+          // included in it (the merchant receives amount − isvAmount). The
+          // `Payments` client emits it ONLY in mode:'isv' and strips it in
+          // merchant mode. We omit it when 0 (no fee) so a no-commission ISV
+          // order never trips Viva's documented `minimum` (30) on the field.
+          // @see docs/internal/payment-api.yaml (create-order body: isvAmount)
+          ...(isvAmount > 0 ? { isvAmount: BigInt(isvAmount) } : {}),
+          // ISV partner's own source (payment-isv-api.yaml:5655); unset → Viva `Default`.
+          ...(options.mode === 'isv'
+            ? { resellerSourceCode: options.resellerSourceCode }
+            : {}),
+        },
+        createOpts,
+      );
+      // Viva normally returns an OrderCode; guard the anomalous empty response
+      // (e.g. an ISV account configured as its own sub-merchant) so it surfaces
+      // as a mappable VIVA_API_ERROR instead of a `.toString()` TypeError → 500.
+      if (response.orderCode == null) {
+        Logger.error(
+          `[createPayment] Viva createOrder returned no orderCode (response keys: ${Object.keys(response ?? {}).join(', ') || 'none'}).`,
+          VIVA_LOG_CONTEXT,
+        );
+        throw VivaPluginError.apiError({ message: 'Viva createOrder returned no orderCode.' });
+      }
+      orderCode = response.orderCode;
+    } catch (err) {
+      if (isRetryableVivaError(err)) {
+        throw VivaPluginError.authDown(err instanceof Error ? err.message : String(err), err);
+      }
+      if (err instanceof VivaApiError) {
+        mapApiError(err);
+      }
+      throw err;
+    }
+
+    const elapsed = Date.now() - callStart;
+    if (elapsed > VIVA_LATENCY_WARN_MS) {
+      Logger.warn(
+        `[createPayment] Viva createOrder took ${elapsed}ms (budget: ${VIVA_LATENCY_WARN_MS}ms).`,
+        VIVA_LOG_CONTEXT,
+      );
+    }
+
+    // Step 12: construct redirect URL
+    const orderCodeStr = orderCode.toString();
+    const redirectUrl = buildCheckoutUrl(options.environment, orderCode, color);
+
+    // Step 13: substitute {orderCode} in success/failure URLs and store on row metadata
+    const successUrl = substitute(successUrlTemplate, { orderCode: orderCodeStr });
+    const failureUrl = substitute(failureUrlTemplate, { orderCode: orderCodeStr });
+
+    // Overwrite the correlation row with the newest orderCode + redirect. No
+    // expiry is stamped: the order is never reused, so its lifespan is Viva's
+    // concern, not ours.
+    const rowMetadata: Record<string, unknown> = {
+      idempotencyKey,
+      redirectUrl,
+      successUrl,
+      failureUrl,
+      vivaMerchantId: storedMerchantId,
+    };
+    await stateMachine.setOrderCode(ctx, row.id, orderCodeStr, rowMetadata);
+
+    // Step 14: return Created state + redirectUrl in metadata
+    return {
+      amount,
+      state: 'Created' as const,
+      metadata: {
+        redirectUrl,
+        vivaOrderCode: orderCodeStr,
+        vivaMerchantId: storedMerchantId,
+        public: {
+          redirectUrl,
+        },
+      },
+    };
+  },
+
+  // -------------------------------------------------------------------------
+  // settlePayment — invoked by webhook worker job (V7), NOT by storefront.
+  //
+  // Mode-agnostic: pure DB mutation (mark viva_transaction row 'captured').
+  // The webhook worker has already validated with Viva via retrieveTransaction
+  // before invoking the state machine, so there is no Viva API call here in
+  // either mode.
+  // -------------------------------------------------------------------------
+  async settlePayment(ctx, _order, payment, _args) {
+    const stateMachine = _stateMachine!;
+
+    // Idempotent: already settled → no-op
+    if (payment.state === 'Settled') {
+      return { success: true as const };
+    }
+
+    const row = await stateMachine.getVivaTransaction(ctx, ctx.channelId, payment.id);
+    if (row) {
+      const existingMeta = row.metadata as Record<string, unknown>;
+      await stateMachine.setStatus(ctx, row.id, 'captured', {
+        ...existingMeta,
+        settledAt: new Date().toISOString(),
+      });
+    }
+
+    return {
+      success: true as const,
+      metadata: { settledAt: new Date().toISOString() },
+    };
+  },
+
+  // -------------------------------------------------------------------------
+  // cancelPayment — invoked by Shop API mutation on ?paymentCancelled=1 (V8)
+  // -------------------------------------------------------------------------
+  async cancelPayment(ctx, _order, payment, _args) {
+    const options = _options!;
+    const stateMachine = _stateMachine!;
+
+    // Step 1: load transaction row
+    const row = await stateMachine.getVivaTransaction(ctx, ctx.channelId, payment.id);
+
+    // Step 2: resolve the Viva order code. Prefer the transaction row, but fall
+    // back to the Payment's own metadata (persisted by createPayment) so a
+    // legitimately-initiated payment stays cancellable even when the row is
+    // missing/lost — the row is not the only record of the order code (#19/#33).
+    const paymentMeta = (payment.metadata ?? {}) as Record<string, unknown>;
+    const vivaOrderCode =
+      row?.vivaOrderCode ?? (paymentMeta['vivaOrderCode'] as string | undefined);
+    if (!vivaOrderCode) {
+      throw VivaPluginError.paymentNotCancellable('No Viva order code found — payment may not have been initiated.');
+    }
+
+    // Step 3: resolve merchantId (ISV mode only — fallback to metadata-stored
+    // value for robustness when the channel custom field was unset after the
+    // row was created, or when the row itself is missing). Merchant mode does
+    // not need it — the Merchant Basic credential already scopes the cancel.
+    // Resolved before the terminal-status check because the #26 reconcile below
+    // re-verifies the transaction with Viva, which (in ISV mode) needs it too.
+    let merchantId: MerchantId | undefined;
+    if (options.mode === 'isv') {
+      const rowMeta = (row?.metadata ?? {}) as Record<string, unknown>;
+      merchantId =
+        (resolveMerchantId(options, ctx) ??
+          (rowMeta['vivaMerchantId'] as MerchantId | undefined) ??
+          (paymentMeta['vivaMerchantId'] as MerchantId | undefined)) as MerchantId;
+      if (!merchantId) {
+        throw VivaPluginError.channelMisconfigured();
+      }
+    }
+
+    // Step 4: terminal-status handling, with a desync reconcile.
+    //
+    // A 'captured' row paired with a Payment that never reached 'Settled' is the
+    // #26 desync: the row was stamped captured (a 1796 sibling no-op, or a settle
+    // that didn't land on THIS payment) while Vendure left the Payment in `Created`.
+    // Blind-refusing here bricks every retry on isvAmountTooHigh(99, 0) — the
+    // `Created` payment still counts in totalCoveredByPayments(), so amountToPay
+    // drops to 0, and there is no Shop-API escape. Reconcile against Viva instead:
+    // re-read the transaction and either complete the order (genuine capture) or
+    // free the payment (row was mis-marked).
+    if (row && row.status === 'captured' && payment.state !== 'Settled') {
+      const txnId = row.vivaTransactionId ?? undefined;
+      let reallyCaptured = false;
+      if (txnId) {
+        try {
+          const isvPayments = getIsvPayments();
+          const opts = options.mode === 'isv' && merchantId ? { merchantId } : {};
+          const tx = await isvPayments.retrieveTransaction(txnId as any, opts);
+          // statusId 'F' = the Viva transaction is finished/captured.
+          reallyCaptured = tx.statusId === 'F';
+        } catch (err) {
+          // Transient verify failure → surface as retryable; the storefront can
+          // re-attempt the cancel once Viva is reachable, rather than bricking.
+          if (isRetryableVivaError(err)) {
+            throw VivaPluginError.authDown(err instanceof Error ? err.message : String(err), err);
+          }
+          // Non-retryable (e.g. 404 — transaction gone): treat as not-captured and
+          // free the payment below.
+        }
+      }
+
+      if (reallyCaptured) {
+        // Money was genuinely taken; the order must COMPLETE, not cancel. Drive the
+        // stranded Payment `Created → Settled` so it stops blocking and the order
+        // reaches PaymentSettled. (Returning a cancel here would leave a captured
+        // Viva order with no matching settled Vendure payment.)
+        Logger.warn(
+          `[cancelPayment] Payment row is 'captured' and Viva confirms ` +
+            `the transaction is captured, but the Vendure Payment was still ` +
+            `'${payment.state}'. Settling it to resolve the desync (#26).`,
+          VIVA_LOG_CONTEXT,
+        );
+        await stateMachine.transitionPaymentToSettled(ctx, _order.id, payment.id);
+        // Cancel is not applicable to a now-settled payment; report failure so the
+        // storefront re-reads order state (now PaymentSettled) and moves to confirmation.
+        throw VivaPluginError.paymentNotCancellable(
+          'Payment was already captured at Viva and has now been settled — order is paid, not cancellable.',
+        );
+      }
+
+      // Not actually captured → the row was mis-marked. Fall through to the normal
+      // cancel path (void the Viva order if still live, then free the Payment) so
+      // the order can be retried. Log loud — this is a recovered desync, #26.
+      Logger.warn(
+        `[cancelPayment] Payment row is 'captured' but Viva does NOT ` +
+          `confirm capture (${txnId ? 'transaction on record' : 'no transaction on record'}); the row was mis-marked. Freeing the ` +
+          `payment so the order can be retried (#26).`,
+        VIVA_LOG_CONTEXT,
+      );
+    } else if (classifyCancel(payment.state) !== 'proceed') {
+      // Defensive: the resolver only delegates here for a cancellable Payment
+      // (`Created`/`Authorized`), so this branch is normally unreachable. But the
+      // handler must never void/transition a Payment that the authoritative
+      // Payment.state says is already paid (`Settled`) or terminal
+      // (`Cancelled`/`Declined`/`Error`). We key the refusal off Payment.state —
+      // NOT the row — so a `Created` payment with a diverged row status (e.g. a
+      // mis-marked `cancelled` row, #27) still cancels instead of bricking. The
+      // captured/unsettled reconcile is handled by the branch above. The message
+      // surfaces the row status when present (the historical desync signal).
+      throw VivaPluginError.paymentNotCancellable(
+        `Payment is already in terminal state: ${row?.status ?? payment.state}.`,
+      );
+    }
+
+    // Step 5: call Viva cancelOrder.
+    //   DELETE /api/orders/{oc} on the legacy host with Basic auth (the v2/OAuth2
+    //   route does not exist — verified 404, see Payments.cancelOrder).
+    // - Merchant mode: uses the construction-time Merchant Basic legacyClient.
+    // - ISV mode: an ISV never holds the connected merchant's ApiKey, so build a
+    //   Reseller-variant client scoped to the connected merchant per-call —
+    //   exactly as the Standard refund path does.
+    const isvPayments = getIsvPayments();
+    const cancelOpts: { merchantId?: MerchantId; legacyClient?: BasicAuthClient } =
+      merchantId !== undefined ? { merchantId } : {};
+    if (options.mode === 'isv') {
+      if (!options.reseller) {
+        throw VivaPluginError.channelMisconfigured(
+          'ISV cancel requires reseller credentials (options.reseller = { resellerId, ' +
+            'merchantId, resellerApiKey }) — the Viva-issued Reseller pair, distinct from ' +
+            'the dashboard ISV credentials. Cancel path: DELETE /api/orders/{oc} on the legacy host.',
+        );
+      }
+      cancelOpts.legacyClient = getResellerLegacyClient(
+        options as VivaPaymentPluginOptions & {
+          reseller: { resellerId: string; resellerApiKey: string };
+        },
+        merchantId as string,
+      );
+    }
+    try {
+      await isvPayments.cancelOrder(BigInt(vivaOrderCode), cancelOpts);
+    } catch (err) {
+      // Transient Viva failure (5xx / auth / network): surface as retryable so
+      // the storefront can re-attempt the cancel. The local Payment stays
+      // `Created`, but that is recoverable — a later cancel succeeds — not a
+      // permanent brick.
+      if (isRetryableVivaError(err)) {
+        throw VivaPluginError.authDown(err instanceof Error ? err.message : String(err), err);
+      }
+      // Any NON-retryable Viva failure — 404 (already gone/expired) OR a 4xx
+      // non-cancellable state (already cancelled, locked, transient reject) —
+      // means the order cannot be voided through the API. We MUST still free the
+      // local Payment: leaving it `Created` keeps Vendure's
+      // totalCoveredByPayments() counting it, so the retry's amountToPay drops to
+      // 0 and createPayment throws isvAmountTooHigh(isvAmount, 0) — permanently
+      // bricking the order with NO Shop-API recovery (the Shop API cannot
+      // transition a Payment). The earlier #14 fix freed only the 404 branch;
+      // this generalises it to its correct scope (#16).
+      //
+      // Race-neutral: cancelOrder on an already-CAPTURED order returns success
+      // (not an error), so the same capture/settle race already exists on the
+      // happy path — broadening the swallow here adds none. A genuinely captured
+      // order is caught earlier by the terminal-status guard (Step 3); a late
+      // 1796 settle for a force-cancelled Payment fails loud in the webhook
+      // worker (operator-visible), never a silent double-charge. The Viva order
+      // expires via paymentTimeout regardless, so nothing is left chargeable.
+      Logger.warn(
+        `[cancelPayment] Viva cancelOrder failed non-retryably (${describeError(err)}) — ` +
+          `cancelling the local Payment anyway so the order can be retried (#16).`,
+        VIVA_LOG_CONTEXT,
+      );
+    }
+
+    // Step 6: update row status (only if a row exists — when cancelling via
+    // payment-metadata fallback there is no row to transition; the Viva order is
+    // already voided above, which is what frees the Payment for retry).
+    if (row) {
+      const existingMeta = row.metadata as Record<string, unknown>;
+      await stateMachine.setStatus(ctx, row.id, 'cancelled', {
+        ...existingMeta,
+        cancelledAt: new Date().toISOString(),
+      });
+    }
+
+    return { success: true as const };
+  },
+
+  // -------------------------------------------------------------------------
+  // createRefund — invoked by Vendure admin refund flow
+  // -------------------------------------------------------------------------
+  async createRefund(ctx, input, amount, _order, payment, _args) {
+    const options = _options!;
+    const stateMachine = _stateMachine!;
+
+    // Step 1: load transaction row
+    const row = await stateMachine.getVivaTransaction(ctx, ctx.channelId, payment.id);
+    if (!row) {
+      throw VivaPluginError.refundRejected('VivaTransaction row not found for this payment.');
+    }
+
+    // Step 2: status must be captured or partially_refunded (#3). Viva caps
+    // cumulative refunds server-side (PaymentsRefundFailedTotalAmountExceeded).
+    if (row.status !== 'captured' && row.status !== 'partially_refunded') {
+      throw VivaPluginError.refundRejected(
+        `Payment not refundable (status: ${row.status}). Refund requires captured or partially_refunded status.`,
+      );
+    }
+
+    // Step 3: need vivaTransactionId (populated by webhook worker V7)
+    if (!row.vivaTransactionId) {
+      throw VivaPluginError.refundRejected('Viva transaction ID not yet known — webhook may be pending.');
+    }
+
+    // Step 4: amount is always sent (ISV spec: `amount` required) — a full
+    // refund passes the full amount.
+    const amountMinor = BigInt(amount);
+
+    // Steps 5-6: merchantId, mode-specific Basic-auth pre-check, and the legacy
+    // client for the refund AND the #2 listing (see resolveRefundAuth).
+    const { merchantId, legacyClient: resellerLegacyClient } = resolveRefundAuth(options, ctx, row);
+
+    // #2: Viva dedupes on this key (idempotencyKey query param). Inputs are all
+    // rolled back with the caller's transaction, so a retry after a failed
+    // COMMIT rebuilds the SAME key → Viva returns the original refund, no money
+    // moves. A legit second equal partial has a larger refundedBefore → new key.
+    // #5: Pending refunds count (Vendure's cap rule), Failed ones don't.
+    const refundedBefore = await stateMachine.getRefundTotal(ctx, payment.id);
+    // #31: Vendure's own cap can't see refunds made outside Vendure; this one
+    // counts them. They stay out of the key: a #2 retry after a failed COMMIT
+    // must rebuild the SAME key even if an outside refund landed in between,
+    // and they never change which keys this plugin has already sent.
+    const assertWithinCap = (r: VivaTransaction) => {
+      const left = payment.amount - refundedBefore - externalRefundTotal(r);
+      if (amount > left) {
+        throw VivaPluginError.refundRejected(
+          `Refund exceeds what is left on this payment: ${left} of ${payment.amount} is left, counting refunds made outside Vendure.`,
+        );
+      }
+    };
+    assertWithinCap(row);
+    // #5: each Failed refund bumps the key (`:f<n>`) so a retry after a decline
+    // can't get a decline Viva cached under the old key (UNVERIFIED). A decline
+    // paid nothing, so the new key can't pay out twice. No suffix at 0: keys of
+    // refunds already in flight stay stable.
+    const failedBefore = await stateMachine.getFailedRefundCount(ctx, payment.id);
+    const keySuffix = `${refundedBefore}:${amount}` + (failedBefore > 0 ? `:f${failedBefore}` : '');
+    const refundIdempotencyKey = refundKeyPrefix(payment.id) + keySuffix;
+
+    const isvPayments = getIsvPayments();
+
+    // Step 6b (#2): a `started` note means an earlier attempt may have refunded
+    // at Viva and then rolled back here. Ask Viva before sending anything.
+    const pending = (row.metadata as Record<string, unknown>)['refundAttempt'] as RefundAttemptNote | undefined;
+    let note!: RefundAttemptNote;
+    let refundResponse: { transactionId: string } | undefined;
+    if (pending?.state === 'started') {
+      const adopted = await reconcileStartedRefund(ctx, stateMachine, isvPayments, row, payment.id, amount, pending, resellerLegacyClient);
+      if (adopted) {
+        note = pending;
+        refundResponse = { transactionId: adopted };
+      }
+    }
+
+    if (!refundResponse) {
+      // Step 6c (#2): commit the note OUTSIDE the caller's transaction before
+      // money can move, so a later rollback can't erase the fact we called Viva.
+      note = { key: refundIdempotencyKey, amountMinor: amount, startedAt: new Date().toISOString(), state: 'started' };
+      try {
+        await stateMachine.commitRefundNote(row.id, note);
+      } catch (err) {
+        Logger.warn(
+          `[createRefund] could not record the refund attempt: ${describeError(err)}`,
+          VIVA_LOG_CONTEXT,
+        );
+        throw VivaPluginError.refundRejected(
+          'Could not record the refund attempt before calling Viva; no refund was sent. Retry the refund on its own.',
+          err,
+        );
+      }
+      // #31: cap again on the row re-read under its lock, held to this
+      // transaction's end, so an outside refund recorded since can't slip past.
+      // Not earlier: commitRefundNote's own connection would wait on the lock.
+      assertWithinCap((await stateMachine.getVivaTransaction(ctx, ctx.channelId, payment.id, true)) ?? row);
+
+      // Step 7: branch refund path on mode.
+      //   ISV mode      → Standard refund only (Payments.refundPayment).
+      //   Merchant mode → resolveRefundStrategy + FastRefundClient, with
+      //                   auto-fallback to Standard on HTTP 403 (auto only).
+      // #30: refunds go to the payment's own source (retrieveTransaction, both
+      // modes; ISV scopes it to the connected merchant); this createOrder chain
+      // is the fallback when Viva doesn't say. `??` keeps it lazy: a host
+      // resolveSourceCode callback that throws must not fail a refund whose
+      // retrieve already supplied the source.
+      const tx = await retrieveForRefund(
+        isvPayments,
+        row.vivaTransactionId,
+        options.mode === 'isv' ? { merchantId } : {},
+      );
+      const sourceCode = tx?.sourceCode ?? resolveSourceCode(options, ctx);
+      try {
+        if (options.mode === 'isv') {
+          refundResponse = await callStandardRefund(
+            isvPayments,
+            row.vivaTransactionId,
+            merchantId,
+            amountMinor,
+            refundIdempotencyKey,
+            sourceCode,
+            resellerLegacyClient,
+          );
+        } else {
+          refundResponse = await refundMerchantMode({
+            options,
+            isvPayments,
+            fastRefundClient: getFastRefundClient(),
+            vivaTransactionId: row.vivaTransactionId,
+            amountMinor,
+            refundIdempotencyKey,
+            rowMerchantId: merchantId,
+            cardType: tx?.cardType,
+            sourceCode,
+          });
+        }
+      } catch (err) {
+        // #5: no clear answer from Viva → a Pending Refund carrying the key; 1797
+        // or checkVivaRefund settles it. Vendure's cap counts Pending, so the same
+        // money can't be refunded twice meanwhile. The note goes `pending` through
+        // ctx: committed with the Pending row (trap 2: the next refund must not
+        // reconcile against it), rolled back to `started` with it (Work 4).
+        // No row bookkeeping until it settles (trap 3).
+        if (!(err instanceof VivaPluginError)) throw err;
+        if (err.code === 'VIVA_REFUND_UNCONFIRMED') {
+          await setRefundNote(ctx, stateMachine, row, payment.id, { ...note, state: 'pending' });
+          // Refund metadata is GraphQL-visible: keep the key minus the payment id
+          // (host rule); pendingRefundKey() rebuilds it.
+          return { state: 'Pending' as const, metadata: { vivaRefundKey: keySuffix } };
+        }
+        // #5 (owner call 2026-11-07): Viva answered and declined (4xx, or 200 +
+        // ErrorCode) → a Failed Refund row, so the decline shows on the order.
+        // Vendure's cap ignores Failed. Metadata keeps Viva's code only: its text
+        // can name the merchant. A never-sent network error has no httpStatus
+        // and still throws (nothing reached Viva).
+        const viva = err.cause;
+        if (err.code === 'VIVA_REFUND_REJECTED' && viva instanceof VivaApiError && viva.httpStatus !== undefined) {
+          await setRefundNote(ctx, stateMachine, row, payment.id, { ...note, state: 'failed' });
+          return { state: 'Failed' as const, metadata: viva.vivaCode !== undefined ? { vivaErrorCode: viva.vivaCode } : {} };
+        }
+        throw err;
+      }
+    }
+
+    // Step 8: row bookkeeping (status, refunded total, note done).
+    await recordSettledRefund(ctx, stateMachine, row, payment, amount, refundResponse.transactionId, {
+      refundAttempt: { ...note, state: 'done' },
+    });
+
+    // Step 9: return per Vendure refund contract
+    return {
+      state: 'Settled' as const,
+      metadata: {
+        vivaRefundResponse: { transactionId: refundResponse.transactionId },
+      },
+    };
+  },
+});
+
+// ---------------------------------------------------------------------------
+// Refund helpers (file-level — exported only via the handler)
+// ---------------------------------------------------------------------------
+
+/**
+ * Refund auth, shared by createRefund and checkVivaRefund.
+ *   - isv: the connected merchant id (channel, else row metadata) and the
+ *     reseller legacy client scoped to it. The refund is `DELETE
+ *     /api/transactions/{id}` with the Viva-issued Reseller pair; an ISV never
+ *     holds a connected merchant's ApiKey (payment-isv-api.yaml:2650).
+ *   - merchant: the configured legacyMerchantId (typed requirement only, not in
+ *     the URL) and no client → Payments' own Merchant Basic client; needs
+ *     legacyMerchantId + legacyApiKey.
+ */
+function resolveRefundAuth(
+  options: VivaPaymentPluginOptions,
+  ctx: RequestContext,
+  row: VivaTransaction,
+): { merchantId: MerchantId; legacyClient: BasicAuthClient | undefined } {
+  if (options.mode !== 'isv') {
+    if (!options.legacyMerchantId || !options.legacyApiKey) {
+      throw VivaPluginError.refundRejected(
+        'Merchant-mode refund requires legacyMerchantId and legacyApiKey (Merchant Basic auth). ' +
+          'Refund path: DELETE /api/transactions/{id} on the legacy host.',
+      );
+    }
+    return { merchantId: options.legacyMerchantId as MerchantId, legacyClient: undefined };
+  }
+  const merchantId =
+    resolveMerchantId(options, ctx) ?? ((row.metadata as Record<string, unknown>)['vivaMerchantId'] as MerchantId | undefined);
+  if (!merchantId) throw VivaPluginError.channelMisconfigured();
+  if (!options.reseller) {
+    throw VivaPluginError.refundRejected(
+      'ISV refund requires reseller credentials (options.reseller = { resellerId, ' +
+        'merchantId, resellerApiKey }). These are the Viva-issued Reseller ID/API key ' +
+        '(demo and production pairs differ; production is obtained from Viva), distinct ' +
+        'from the dashboard ISV credentials.',
+    );
+  }
+  return {
+    merchantId,
+    legacyClient: getResellerLegacyClient(
+      options as VivaPaymentPluginOptions & { reseller: { resellerId: string; resellerApiKey: string } },
+      merchantId,
+    ),
+  };
+}
+
+/** Viva's refunds of the row's payment (legacy `?ordercode=` listing); `fail` builds the error when it can't be asked. */
+async function listPaymentRefunds(
+  payments: Payments,
+  row: VivaTransaction,
+  legacyClient: BasicAuthClient | undefined,
+  fail: (why: string, cause?: unknown) => Error,
+): Promise<Awaited<ReturnType<Payments['listRefunds']>>> {
+  if (!row.vivaOrderCode) throw fail('no Viva order code on record to look it up');
+  try {
+    return await payments.listRefunds(
+      BigInt(row.vivaOrderCode) as OrderCode,
+      row.vivaTransactionId as TransactionId,
+      legacyClient ? { legacyClient } : {},
+    );
+  } catch (err) {
+    throw fail('the Viva refund listing failed', err);
+  }
+}
+
+/** Write the refund note through `ctx` (rolls back with the caller), status unchanged. */
+async function setRefundNote(
+  ctx: RequestContext,
+  stateMachine: StateMachineService,
+  row: VivaTransaction,
+  paymentId: ID,
+  note: RefundAttemptNote,
+): Promise<void> {
+  const fresh = (await stateMachine.getVivaTransaction(ctx, row.channelId, paymentId, true)) ?? row;
+  await stateMachine.setStatus(ctx, row.id, fresh.status, {
+    ...(fresh.metadata as Record<string, unknown>),
+    refundAttempt: note,
+  });
+}
+
+/**
+ * Row bookkeeping once a refund of `amount` is Settled: status goes `refunded`
+ * once Settled refunds reach the payment amount (#3: £3 + £7 on £10), else
+ * `partially_refunded`. Pending refunds don't count (#5: one may still fail).
+ * Called by createRefund (Step 8) and, for a Pending refund, at settle time
+ * (#5 trap 3), in both cases BEFORE the refund itself is Settled in the DB.
+ * Re-reads the row under its lock: a caller's snapshot can predate the committed
+ * refund note, and spreading it would wipe that (and any other) concurrent
+ * metadata write, e.g. an outside refund (#31).
+ */
+async function recordSettledRefund(
+  ctx: RequestContext,
+  stateMachine: StateMachineService,
+  row: VivaTransaction,
+  payment: { id: ID; amount: number },
+  amount: number,
+  transactionId: string,
+  extraMeta: Record<string, unknown> = {},
+): Promise<void> {
+  const settledBefore = await stateMachine.getSettledRefundTotal(ctx, payment.id);
+  const fresh = (await stateMachine.getVivaTransaction(ctx, row.channelId, payment.id, true)) ?? row;
+  // #31: refunds made outside Vendure count toward `refunded` too.
+  const newStatus = refundStatusFor(settledBefore + amount + externalRefundTotal(fresh), payment.amount);
+  const existingMeta = fresh.metadata as Record<string, unknown>;
+  const refundedSoFar = (existingMeta['refundedAmountMinor'] as number | undefined) ?? 0;
+  await stateMachine.setStatus(ctx, row.id, newStatus, {
+    ...existingMeta,
+    refundedAmountMinor: refundedSoFar + amount,
+    lastRefundTransactionId: transactionId,
+    lastRefundAt: new Date().toISOString(),
+    ...extraMeta,
+  });
+}
+
+/**
+ * #2 reconcile: an earlier attempt left a `started` note, so Viva may hold a
+ * refund Vendure rolled back. List Viva's refunds of this payment, drop those
+ * Vendure already has as Settled Refunds (by Viva transaction id), and keep
+ * only the rest whose `merchantTrns` equals the NOTE's key — every refund
+ * DELETE we send is tagged with its idempotency key; dashboard refunds carry
+ * none (null), so they are ignored and never block.
+ *   - none tagged with the note key          → undefined (resend; covers a
+ *                                              call that never landed).
+ *   - exactly one, amount == note amount AND
+ *     == this request's amount               → return its id (adopt; no DELETE).
+ *   - exactly one, amounts differ            → refuse: staff retried with another
+ *                                              amount after the earlier one landed.
+ *   - more than one tagged, or listing fails → refuse; never resend blindly (the
+ *                                              key may have expired at Viva).
+ */
+async function reconcileStartedRefund(
+  ctx: RequestContext,
+  stateMachine: StateMachineService,
+  isvPayments: Payments,
+  row: VivaTransaction,
+  paymentId: ID,
+  amount: number,
+  note: RefundAttemptNote,
+  legacyClient: BasicAuthClient | undefined,
+): Promise<string | undefined> {
+  // #4: no identifiers in the thrown message nor in the log (host rule).
+  const refuse = (why: string, cause?: unknown) => {
+    Logger.warn(
+      `[createRefund] refund unconfirmed: ${why}${cause !== undefined ? ` (${describeError(cause)})` : ''}`,
+      VIVA_LOG_CONTEXT,
+    );
+    return VivaPluginError.refundUnconfirmed(
+      `${REFUND_UNCONFIRMED_MESSAGE} An earlier attempt of this refund could not be confirmed: ${why}.`,
+      cause,
+    );
+  };
+  const listed = await listPaymentRefunds(isvPayments, row, legacyClient, refuse);
+
+  const known = await settledVivaRefundIds(ctx, stateMachine, paymentId);
+  const ours = listed.filter((r) => !known.has(r.transactionId) && r.merchantTrns === note.key);
+  if (ours.length === 0) return undefined;
+  if (ours.length > 1) {
+    throw refuse(`Viva lists ${ours.length} refunds tagged with the earlier attempt's key`);
+  }
+  const landed = ours[0]!;
+  if (landed.amountMinor !== BigInt(note.amountMinor)) {
+    throw refuse(`a Viva refund carries the earlier key but is ${landed.amountMinor}, not ${note.amountMinor}`);
+  }
+  if (landed.amountMinor !== BigInt(amount)) {
+    Logger.warn(
+      `[createRefund] earlier refund of ${landed.amountMinor} landed at Viva but is unrecorded; ` +
+        `this request is for ${amount}.`,
+      VIVA_LOG_CONTEXT,
+    );
+    throw VivaPluginError.refundUnconfirmed(
+      `${REFUND_UNCONFIRMED_MESSAGE} An earlier refund of ${landed.amountMinor} for this payment is at Viva ` +
+        `but not recorded in Vendure; this request is for ${amount}.`,
+    );
+  }
+  return landed.transactionId;
+}
+
+/** #5: a Pending refund's full key; its (GraphQL-visible) metadata keeps only the part after the payment id. */
+export function pendingRefundKey(refund: { paymentId: ID; metadata: unknown }): string | undefined {
+  const suffix = (refund.metadata as Record<string, unknown> | null)?.['vivaRefundKey'];
+  return typeof suffix === 'string' ? refundKeyPrefix(refund.paymentId) + suffix : undefined;
+}
+
+/** Start of every refund key this plugin sends for a payment (`viva:refund:{paymentId}:`). */
+function refundKeyPrefix(paymentId: ID): string {
+  return `viva:refund:${String(paymentId)}:`;
+}
+
+/**
+ * #5: resolve a Pending Viva Refund from Viva's own (authenticated) refund
+ * listing, by the key it was tagged with (`merchantTrns`). Shared by the Admin
+ * `checkVivaRefund` mutation and webhook 1797 (whose envelope is only a lookup
+ * hint; this listing is the proof).
+ *   - not Pending                → returned as is (replay / already resolved).
+ *   - one listed, amount matches → row bookkeeping (trap 3), then Settled.
+ *   - none listed                → 'absent', still Pending; the caller decides:
+ *                                  the check fails it (failVivaRefund: Viva has no
+ *                                  refund with this key, so a fresh refund is
+ *                                  safe), 1797 retries.
+ *   - listing fails, or a listed refund doesn't match → throws; stays Pending,
+ *                                  never Failed on a guess.
+ * No identifiers in thrown messages or logs (host rule).
+ */
+export async function checkVivaRefund(
+  ctx: RequestContext,
+  refundId: ID,
+): Promise<{ outcome: 'settled' | 'failed' | 'absent'; refund: Refund }> {
+  const options = _options!;
+  const stateMachine = _stateMachine!;
+  const refund = await stateMachine.getRefund(ctx, refundId);
+  if (!refund) throw VivaPluginError.refundRejected('Refund not found.');
+  if (refund.state !== 'Pending') return { outcome: refund.state === 'Failed' ? 'failed' : 'settled', refund };
+
+  const key = pendingRefundKey(refund);
+  const row = await stateMachine.getVivaTransaction(ctx, ctx.channelId, refund.paymentId);
+  if (!key || !row?.vivaOrderCode || !row.vivaTransactionId) {
+    throw VivaPluginError.refundRejected('This is not a pending Viva refund; there is nothing to check at Viva.');
+  }
+  // createRefund's own config checks: a misconfiguration is a config error, not "stays Pending".
+  const { legacyClient } = resolveRefundAuth(options, ctx, row);
+
+  const stillPending = (why: string, cause?: unknown) => {
+    Logger.warn(
+      `[checkVivaRefund] refund stays Pending: ${why}${cause !== undefined ? ` (${describeError(cause)})` : ''}`,
+      VIVA_LOG_CONTEXT,
+    );
+    return VivaPluginError.refundUnconfirmed(`This refund stays pending: ${why}. Check again later or check the Viva dashboard.`, cause);
+  };
+  const listed = await listPaymentRefunds(getIsvPayments(), row, legacyClient, stillPending);
+
+  const ours = listed.filter((r) => r.merchantTrns === key);
+  if (ours.length === 0) return { outcome: 'absent', refund };
+  const landed = ours[0]!;
+  if (ours.length > 1 || landed.amountMinor !== BigInt(refund.total)) {
+    throw stillPending(`Viva lists ${ours.length} refund(s) for this key that do not match its amount`);
+  }
+  const note = ownRefundNote(row, key);
+  await recordSettledRefund(
+    ctx, stateMachine, row, refund.payment, refund.total, landed.transactionId,
+    note ? { refundAttempt: { ...note, state: 'done' } } : {},
+  );
+  return { outcome: 'settled', refund: await stateMachine.settleRefund(ctx, refund.id, landed.transactionId) };
+}
+
+/** #5 check: Viva has no refund with this Pending refund's key → Failed (a fresh refund is then safe). */
+export async function failVivaRefund(ctx: RequestContext, refund: Refund): Promise<Refund> {
+  const stateMachine = _stateMachine!;
+  const row = await stateMachine.getVivaTransaction(ctx, ctx.channelId, refund.paymentId);
+  const note = row ? ownRefundNote(row, pendingRefundKey(refund)) : undefined;
+  Logger.info('[checkVivaRefund] Viva has no refund with this key; marking the refund Failed.', VIVA_LOG_CONTEXT);
+  if (row && note) await setRefundNote(ctx, stateMachine, row, refund.paymentId, { ...note, state: 'failed' });
+  return stateMachine.failRefund(ctx, refund.id);
+}
+
+/**
+ * #31: a refund Viva made outside Vendure, kept on the plugin's own row
+ * (`metadata.externalRefunds`, never GraphQL-visible).
+ */
+interface ExternalRefund {
+  transactionId: string;
+  amountMinor: number;
+  /** Viva's InsDate of the refund, verbatim. */
+  at: string;
+}
+
+/** Row status once `total` (Settled Vendure + outside refunds, minor units) is refunded. */
+function refundStatusFor(total: number, paymentAmount: number): 'refunded' | 'partially_refunded' {
+  return total >= paymentAmount ? 'refunded' : 'partially_refunded';
+}
+
+function externalRefundTotal(row: VivaTransaction): number {
+  return externalRefunds(row).reduce((sum, e) => sum + e.amountMinor, 0);
+}
+
+function externalRefunds(row: VivaTransaction): ExternalRefund[] {
+  return ((row.metadata as Record<string, unknown>)['externalRefunds'] as ExternalRefund[] | undefined) ?? [];
+}
+
+/** Viva transaction ids of this payment's Settled Vendure refunds. */
+async function settledVivaRefundIds(ctx: RequestContext, stateMachine: StateMachineService, paymentId: ID): Promise<Set<string | undefined>> {
+  // #5 trap 4: a refund settled via settleRefund (1797 / checkVivaRefund) carries
+  // its Viva id in `transactionId`, not in the handler's metadata.
+  return new Set(
+    (await stateMachine.getSettledRefunds(ctx, paymentId)).flatMap((r) => [
+      r.transactionId,
+      (r.metadata as { vivaRefundResponse?: { transactionId?: string } } | null)?.vivaRefundResponse?.transactionId,
+    ]),
+  );
+}
+
+/**
+ * #31: record a refund Viva made outside Vendure (a 1797 matching no Pending
+ * refund). The envelope only names the refund: its amount and time come from
+ * Viva's AUTHENTICATED refund listing for this payment. No Viva call that moves
+ * money and no Vendure Refund (`refundOrder` would run createRefund and pay
+ * again): an entry on the row, which createRefund's cap and the
+ * row status count. Run inside a transaction: the row is locked while recording.
+ *   - already recorded, or a Settled Vendure refund → 'known' (replay; no Viva call)
+ *   - listed with this plugin's key and a non-Failed Vendure refund with that key,
+ *     or the row's `started` note for it → 'known': ours, in flight or left to the
+ *     #2 reconcile, so counting it would count it twice. Our key with neither (an
+ *     orphan, e.g. its note was overwritten) is recorded like any outside refund.
+ *   - not listed → 'absent' (the listing may lag; 1797 retries)
+ *   - listing fails → throws, nothing recorded
+ * No identifiers in thrown messages or logs (host rule).
+ */
+export async function recordExternalRefund(
+  ctx: RequestContext,
+  payment: { id: ID; amount: number },
+  transactionId: string,
+): Promise<{ outcome: 'recorded'; amount: number } | { outcome: 'known' | 'absent' }> {
+  const stateMachine = _stateMachine!;
+  const isKnown = async (r: VivaTransaction) =>
+    externalRefunds(r).some((e) => e.transactionId === transactionId) ||
+    (await settledVivaRefundIds(ctx, stateMachine, payment.id)).has(transactionId);
+
+  const row = await stateMachine.getVivaTransaction(ctx, ctx.channelId, payment.id);
+  if (!row?.vivaTransactionId) throw new Error('No Viva payment on record for this refund.');
+  if (await isKnown(row)) return { outcome: 'known' };
+
+  const { legacyClient } = resolveRefundAuth(_options!, ctx, row);
+  const cantCheck = (why: string, cause?: unknown) => {
+    Logger.warn(
+      `[webhook] 1797: refund made outside Vendure not recorded yet: ${why}${cause !== undefined ? ` (${describeError(cause)})` : ''}`,
+      VIVA_LOG_CONTEXT,
+    );
+    return new Error(`Refund made outside Vendure not recorded yet: ${why}.`, { cause });
+  };
+  const listed = (await listPaymentRefunds(getIsvPayments(), row, legacyClient, cantCheck)).find(
+    (r) => r.transactionId === transactionId,
+  );
+  if (!listed) return { outcome: 'absent' };
+
+  const fresh = (await stateMachine.getVivaTransaction(ctx, row.channelId, payment.id, true)) ?? row;
+  if (await isKnown(fresh)) return { outcome: 'known' };
+  const trns = listed.merchantTrns;
+  if (
+    trns?.startsWith(refundKeyPrefix(payment.id)) &&
+    (ownRefundNote(fresh, trns)?.state === 'started' ||
+      (await stateMachine.getNonFailedRefunds(ctx, payment.id)).some((r) => pendingRefundKey(r) === trns))
+  ) {
+    return { outcome: 'known' };
+  }
+  const amount = Number(listed.amountMinor);
+  const externalTotal = externalRefundTotal(fresh) + amount;
+  const settled = await stateMachine.getSettledRefundTotal(ctx, payment.id);
+  const entry: ExternalRefund = { transactionId, amountMinor: amount, at: listed.insDate };
+  // Only a refundable row moves; any other state (pending, cancelled…) is kept.
+  const refundable = fresh.status === 'captured' || fresh.status === 'partially_refunded';
+  const status = refundable ? refundStatusFor(settled + externalTotal, payment.amount) : fresh.status;
+  await stateMachine.setStatus(ctx, fresh.id, status, {
+    ...(fresh.metadata as Record<string, unknown>),
+    externalRefunds: [...externalRefunds(fresh), entry],
+  });
+  return { outcome: 'recorded', amount };
+}
+
+/**
+ * The row's refund note if it is still this refund's (it goes final with the
+ * refund); a later refund's `started` note must keep its reconcile.
+ */
+function ownRefundNote(row: VivaTransaction, key: string | undefined): RefundAttemptNote | undefined {
+  const note = (row.metadata as Record<string, unknown>)['refundAttempt'] as RefundAttemptNote | undefined;
+  return key !== undefined && note?.key === key ? note : undefined;
+}
+
+/**
+ * Call the Standard (legacy/Basic-auth) refund path via `Payments.refundPayment`.
+ *
+ * Failures map through `refundCallError` (5xx / maybe-sent → VIVA_REFUND_UNCONFIRMED).
+ *
+ * @see references/viva-docs/md/tut-create-recurring-payment.txt:288
+ */
+async function callStandardRefund(
+  isvPayments: Payments,
+  vivaTransactionId: string,
+  merchantId: MerchantId,
+  amountMinor: bigint,
+  refundIdempotencyKey: string,
+  sourceCode: string,
+  legacyClientOverride?: BasicAuthClient,
+  // #32: merchant `auto` fallback sends a fresh idempotencyKey but keeps the
+  // bare key as merchantTrns (what reconcile and 1797 match on).
+  merchantTrns: string = refundIdempotencyKey,
+): Promise<{ transactionId: string }> {
+  try {
+    const opts: {
+      merchantId: MerchantId;
+      idempotencyKey: string;
+      merchantTrns: string;
+      amountMinor: bigint;
+      sourceCode: string;
+      legacyClient?: BasicAuthClient;
+    } = {
+      merchantId,
+      idempotencyKey: refundIdempotencyKey,
+      // #2: tag the refund with our key so a retry can tell it from dashboard refunds.
+      merchantTrns,
+      amountMinor,
+      sourceCode,
+    };
+    // ISV mode injects a reseller-variant client scoped to the connected
+    // merchant; merchant mode leaves this undefined to use the Merchant Basic
+    // client wired at construction time.
+    if (legacyClientOverride !== undefined) opts.legacyClient = legacyClientOverride;
+    const refundResponse = await isvPayments.refundPayment(vivaTransactionId as any, opts);
+    return { transactionId: refundResponse.transactionId as string };
+  } catch (err) {
+    throw refundCallError(err);
+  }
+}
+
+/**
+ * Map a failed refund call (Standard DELETE or Fast Refund).
+ *   - 5xx, or a network failure after the request may have left (core's
+ *     maybe-sent class: ECONNRESET, socket/body timeouts, our AbortError)
+ *     → VIVA_REFUND_UNCONFIRMED (#4). The `started` note stays, so the next
+ *     retry reconciles against Viva's listing instead of resending blind.
+ *   - auth failure → VIVA_AUTH_DOWN (retryable, nothing sent).
+ *   - other VivaApiError (4xx, 200 failure body, never-sent network error)
+ *     → VIVA_REFUND_REJECTED.
+ */
+// `endpoint` names the Viva call that failed (#32: a replayed Fast Refund error
+// on the Standard DELETE read like a merchant-permission problem).
+function refundCallError(err: unknown, endpoint: 'Standard refund' | 'Fast Refund' = 'Standard refund'): unknown {
+  if (err instanceof VivaApiError) {
+    const maybeSent =
+      err.httpStatus === undefined ? !connectionRetryAllowed(err.cause, false) : err.httpStatus >= 500;
+    if (maybeSent) {
+      Logger.warn(
+        `[createRefund] ${endpoint} call failed after it may have reached Viva: ${describeError(err)}`,
+        VIVA_LOG_CONTEXT,
+      );
+      return VivaPluginError.refundUnconfirmed(
+        `${REFUND_UNCONFIRMED_MESSAGE} The refund was sent to Viva but no confirmation came back.`,
+        err,
+      );
+    }
+  }
+  if (isRetryableVivaError(err)) {
+    return VivaPluginError.authDown(err instanceof Error ? err.message : String(err), err);
+  }
+  if (err instanceof VivaApiError) {
+    // Viva's ErrorText can name the transaction or merchant id (#4, #30): keep
+    // the reason for staff and operators, drop ids. `corr` is Viva's
+    // x-viva-correlationid, a request trace id (no merchant/order/txn) for support tickets.
+    Logger.warn(
+      `[createRefund] Viva rejected ${endpoint}: ${describeError(err)}${describeVivaRejection(err)}`,
+      VIVA_LOG_CONTEXT,
+    );
+    return VivaPluginError.refundRejected(redactIds(err.message), err);
+  }
+  return err;
+}
+
+/**
+ * #30: the payment's own source (and cardType) before refunding. A failed
+ * retrieve never blocks the refund: log (no ids) and return undefined so the
+ * caller uses its fallback source (merchant `auto` then routes Standard, no cardType).
+ * ISV mode passes the connected `merchantId`; merchant mode passes none.
+ */
+async function retrieveForRefund(
+  isvPayments: Payments,
+  vivaTransactionId: string,
+  opts: { merchantId?: MerchantId },
+): Promise<{ cardType?: string; sourceCode?: string } | undefined> {
+  try {
+    return await isvPayments.retrieveTransaction(vivaTransactionId as TransactionId, opts);
+  } catch (err) {
+    Logger.warn(
+      `[createRefund] retrieveTransaction failed (${describeError(err)}); refunding to the fallback source.`,
+      VIVA_LOG_CONTEXT,
+    );
+    return undefined;
+  }
+}
+
+/** Shared VIVA_REFUND_UNCONFIRMED lead. Neutral on where staff refund: the host decides that. */
+const REFUND_UNCONFIRMED_MESSAGE =
+  'This refund may already have gone through at Viva. Check the Viva dashboard before doing anything else.';
+
+/**
+ * Merchant-mode refund routing — Fast vs Standard with auto-fallback.
+ *
+ * Flow:
+ *   1. cardType + sourceCode come from the caller's retrieveTransaction (#30);
+ *      no cardType (retrieve failed) → `auto-no-card-info` → Standard.
+ *   2. resolveRefundStrategy(config.refundStrategy ?? 'auto', { cardType, CNP: true }).
+ *      Smart Checkout is always card-not-present (CNP).
+ *   3. decision.kind === 'fast'  → FastRefundClient.refund:
+ *        - 403 + strategy === 'fast'  → VIVA_REFUND_REJECTED with the
+ *          "fast does not fall back" message (mirrors medusa slice B).
+ *        - 403 + strategy === 'auto'  → fall through to Standard refund.
+ *        - any other error            → wrap via the standard error envelope.
+ *   4. decision.kind === 'standard' → callStandardRefund.
+ *
+ * @see docs/ENDPOINTS.md §4
+ * @see docs/plans/multi-mode-v0.md §8.5a
+ * @see references/payment-api.yaml:9255 (Fast Refund 403 semantics)
+ */
+async function refundMerchantMode(params: {
+  options: VivaMerchantOptions;
+  isvPayments: Payments;
+  fastRefundClient: FastRefundClient;
+  vivaTransactionId: string;
+  amountMinor: bigint;
+  refundIdempotencyKey: string;
+  rowMerchantId: MerchantId;
+  cardType: string | undefined;
+  sourceCode: string;
+}): Promise<{ transactionId: string }> {
+  const {
+    options,
+    isvPayments,
+    fastRefundClient,
+    vivaTransactionId,
+    amountMinor,
+    refundIdempotencyKey,
+    rowMerchantId,
+    cardType,
+    sourceCode,
+  } = params;
+
+  const configuredStrategy = options.refundStrategy ?? 'auto';
+
+  // Step 2: resolve strategy.
+  const decision = resolveRefundStrategy(configuredStrategy, {
+    ...(cardType !== undefined ? { cardType } : {}),
+    isCardNotPresent: true, // Smart Checkout — always CNP
+  });
+
+  // #32: Viva dedupes `idempotencyKey` across endpoints — a Standard DELETE
+  // sent with the key the failed Fast Refund already consumed gets the Fast
+  // Refund's 403 body replayed (HTTP 200, ErrorCode 403). The fallback
+  // therefore sends a key Viva has not seen. `merchantTrns` keeps the bare
+  // key: reconcile and the 1797 settle match on it, and a #2 retry rebuilds
+  // the same `:std` key, so Viva still returns the original refund.
+  let standardKey = refundIdempotencyKey;
+
+  if (decision.kind === 'fast') {
+    standardKey = `${refundIdempotencyKey}:std`;
+    try {
+      const result = await fastRefundClient.refund({
+        transactionId: vivaTransactionId as any,
+        amount: amountMinor as any,
+        sourceCode,
+        merchantTrns: refundIdempotencyKey,
+        idempotencyKey: refundIdempotencyKey,
+      });
+      return { transactionId: result.transactionId as string };
+    } catch (err) {
+      const is403 = err instanceof VivaApiError && err.httpStatus === 403;
+      if (is403 && configuredStrategy === 'fast') {
+        // Explicit `fast` opt-in does not fall back — surface as a distinct
+        // code so callers can prompt operators to switch to 'auto' instead of
+        // treating it as a generic refund rejection.
+        throw VivaPluginError.fastRefundIneligible(undefined, err);
+      }
+      if (!is403) throw refundCallError(err, 'Fast Refund');
+      // is403 + auto → fall through to Standard refund. Viva's reason can name
+      // the merchant id (#30): redact it; corr is Viva's request trace id.
+      Logger.info(
+        `[createRefund] Fast Refund 403 with strategy='auto' — falling back to Standard refund` +
+          describeVivaRejection(err),
+        VIVA_LOG_CONTEXT,
+      );
+    }
+  }
+
+  // Standard refund — Payments.refundPayment routes via legacy/Basic auth.
+  return callStandardRefund(
+    isvPayments,
+    vivaTransactionId,
+    rowMerchantId,
+    amountMinor,
+    standardKey,
+    sourceCode,
+    undefined,
+    refundIdempotencyKey,
+  );
+}
